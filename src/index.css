@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+  }
+  
+  code, pre {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+@keyframes pulseGlow {
+  0%, 100% {
+    box-shadow: 0 0 25px 8px rgba(6, 182, 212, 0.45), inset 0 0 20px 4px rgba(56, 189, 248, 0.6);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 0 45px 16px rgba(14, 165, 233, 0.7), inset 0 0 30px 8px rgba(125, 211, 252, 0.9);
+    transform: scale(1.04);
+  }
+}
+
+@keyframes arcRotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes arcRotateReverse {
+  from {
+    transform: rotate(360deg);
+  }
+  to {
+    transform: rotate(0deg);
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulseGlow 3s ease-in-out infinite;
+}
+
+.animate-arc-rotate {
+  animation: arcRotate 18s linear infinite;
+}
+
+.animate-arc-rotate-reverse {
+  animation: arcRotateReverse 14s linear infinite;
+}

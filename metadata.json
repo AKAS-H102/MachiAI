@@ -1,0 +1,10 @@
+{
+  "name": "Machi - Friendly Personal AI Assistant",
+  "description": "Voice-controlled personal AI assistant inspired by JARVIS with Tamil, Tanglish, and English voice interactions, local wake-word detection, smart reminders, notification announcements, and independent Windows & Android clients.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

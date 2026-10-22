@@ -1,0 +1,12 @@
+# Render Blueprint: deploys the Machi backend + web app.
+services:
+  - type: web
+    name: machi-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/machi/status
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false        # you paste the key in Render's dashboard; it is never stored in this repo

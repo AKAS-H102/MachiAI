@@ -1,0 +1,39 @@
+# Machi — status after round 2
+
+## Why the problem persisted after the previous ZIP
+The `release/Machi.apk` (and `Machi-Setup.exe`) inside the previous ZIP were the OLD builds. Their bundled web
+assets still contained the dead AI-Studio preview URL (`ais-pre-…run.app`) and the hardcoded
+"local fallback mode-la…" reply. The previous round edited source only and never rebuilt, so installing that APK
+reproduced the same behaviour. Those stale binaries (and the stale bundled web assets / server bundles) are now
+REMOVED from this ZIP so they cannot be installed by mistake.
+
+A working app needs two things that this sandbox did not have: (1) a deployed HTTPS backend with a real
+`GEMINI_API_KEY`, and (2) an Android SDK build. Neither could be done here, so NO new APK/EXE is included.
+
+## Changes in this round (source)
+- `server.ts`: deleted the dead canned-answer code (`KNOWLEDGE_FALLBACK`, `generateSmartFallbackReply`);
+  tightened the instant-call shortcut ("pick up" matched ordinary sentences); removed the non-standard
+  `speechMetadata` field from the Gemini TTS request (voice stays Puck/Charon, unchanged); chat history from the
+  client is validated, capped, and must start with a user turn; context window raised 4 -> 8 messages.
+- `src/App.tsx`: synchronous in-flight guard (ref) so double-tap / voice + typed sends cannot fire two requests;
+  follow-up context window 4 -> 8 messages.
+(Earlier round, still in place: no hardcoded URL, real error bubbles with Retry, PCM->WAV, native TTS fallback,
+audio focus, mic permission handling.)
+
+## Build / deploy (required)
+1. Deploy to Render using `render.yaml`; set `GEMINI_API_KEY` in the dashboard (never in the repo).
+2. Check `https://<name>.onrender.com/api/machi/status` shows `"geminiConfigured": true`.
+3. `curl -X POST https://<name>.onrender.com/api/machi/chat -H 'Content-Type: application/json' -d '{"message":"Hello Machi"}'`
+   (note: exactly "Hello Machi" goes to the AI; "Hi Machi" is an instant canned greeting).
+4. `BACKEND_URL=https://<name>.onrender.com ./build-android.sh` (needs JDK 17+, Android build-tools, Node 20+).
+5. Windows: `npm run build`, bundle `server.ts` to `staging-windows/server.cjs`, put a `.env` with
+   `GEMINI_API_KEY` next to it, then compile `Machi-Setup.nsi` with NSIS. (`start_machi.bat` expects `node.exe`
+   beside `server.cjs`.)
+6. Android log check: `adb logcat -s Machi`.
+
+## Test status (honest)
+Executed: TypeScript syntax parse of server.ts, App.tsx, machiVoice.ts (0 errors); grep confirmed the old APK
+contained the dead URL and the fallback string, and the current source contains neither.
+NOT executed (no network, no API key, no Android SDK/NSIS, no device): npm install, vite build, server start,
+real AI reply, follow-up context, TTS audio generation/playback, Replay Voice, microphone/STT, hands-free loop,
+APK build/install, Windows installer build.
