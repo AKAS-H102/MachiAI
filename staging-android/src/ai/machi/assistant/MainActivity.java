@@ -21,6 +21,16 @@ import android.util.Base64;
 import android.media.MediaPlayer;
 import android.media.AudioManager;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
+import android.os.Handler;
+import android.os.Looper;
+import android.speech.tts.Voice;
+import java.util.Set;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import android.speech.SpeechRecognizer;
 import android.speech.RecognizerIntent;
 import android.speech.RecognitionListener;
@@ -50,6 +60,13 @@ public class MainActivity extends Activity {
     private AudioManager.OnAudioFocusChangeListener mFocusListener;
     private boolean mPendingStartListening = false;
     private String mPendingListenLang = "en-IN";
+    private String mPendingTtsVoice = null;
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private boolean mScoActive = false;
+    private BroadcastReceiver mScoReceiver = null;
+    private Runnable mScoPending = null;
+    private AudioDeviceCallback mRouteCallback = null;
+    private static final String BT_CONNECT = "android.permission.BLUETOOTH_CONNECT";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -119,9 +136,28 @@ public class MainActivity extends Activity {
         });
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            ArrayList<String> need = new ArrayList<String>();
             if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, PERMISSION_REQUEST_CODE);
+                need.add(android.Manifest.permission.RECORD_AUDIO);
             }
+            if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(BT_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                need.add(BT_CONNECT);
+            }
+            if (!need.isEmpty()) {
+                requestPermissions(need.toArray(new String[0]), PERMISSION_REQUEST_CODE);
+            }
+        }
+
+        // Follow headset / earbuds being connected or removed (built-in mic <-> wired <-> Bluetooth)
+        if (Build.VERSION.SDK_INT >= 23 && mAudioManager != null) {
+            mRouteCallback = new AudioDeviceCallback() {
+                @Override public void onAudioDevicesAdded(AudioDeviceInfo[] added) { refreshRouteLabel(); }
+                @Override public void onAudioDevicesRemoved(AudioDeviceInfo[] removed) {
+                    if (mScoActive && findInput(true) == null) stopBluetoothCall();
+                    refreshRouteLabel();
+                }
+            };
+            mAudioManager.registerAudioDeviceCallback(mRouteCallback, mHandler);
         }
 
         loadMachiApp();
@@ -177,7 +213,7 @@ public class MainActivity extends Activity {
                     }
                 };
             }
-            int r = mAudioManager.requestAudioFocus(mFocusListener, AudioManager.STREAM_MUSIC,
+            int r = mAudioManager.requestAudioFocus(mFocusListener, mScoActive ? AudioManager.STREAM_VOICE_CALL : AudioManager.STREAM_MUSIC,
                     AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
             Log.d(TAG, "audio focus request result=" + r);
         } catch (Exception e) {
@@ -192,7 +228,7 @@ public class MainActivity extends Activity {
     }
 
     private void ensureTts(final Runnable onReady) {
-        if (mTts != null && mTtsReady) { onReady.run(); return; }
+        if (mTts != null && mTtsReady) { if (onReady != null) onReady.run(); return; }
         if (mTts != null) return; // initialising; pending text is flushed in onInit
         mTts = new TextToSpeech(getApplicationContext(), new TextToSpeech.OnInitListener() {
             @Override public void onInit(int status) {
@@ -217,15 +253,16 @@ public class MainActivity extends Activity {
                         evalJs("window.onMachiNativeTtsError && window.onMachiNativeTtsError('tts_utterance_error');");
                     }
                 });
+                pushVoicesToJs();
                 if (mPendingTtsText != null) {
                     String t = mPendingTtsText; mPendingTtsText = null;
-                    doSpeakText(t, mPendingTtsLang);
+                    doSpeakText(t, mPendingTtsLang, mPendingTtsVoice);
                 }
             }
         });
     }
 
-    private void doSpeakText(String text, String lang) {
+    private void doSpeakText(String text, String lang, String voiceName) {
         if (mTts == null || !mTtsReady) {
             evalJs("window.onMachiNativeTtsError && window.onMachiNativeTtsError('tts_not_ready');");
             return;
@@ -239,6 +276,22 @@ public class MainActivity extends Activity {
                 evalJs("window.onMachiNativeTtsError && window.onMachiNativeTtsError('tts_language_unsupported');");
                 return;
             }
+        }
+        // A specific phone voice chosen in the app overrides the language default
+        if (voiceName != null && voiceName.length() > 0 && Build.VERSION.SDK_INT >= 21) {
+            try {
+                Voice chosen = null;
+                Set<Voice> all = mTts.getVoices();
+                if (all != null) for (Voice v : all) { if (voiceName.equals(v.getName())) { chosen = v; break; } }
+                if (chosen != null) mTts.setVoice(chosen); else Log.w(TAG, "phone voice not found: " + voiceName);
+            } catch (Exception e) { Log.w(TAG, "setVoice failed: " + e.getMessage()); }
+        }
+        if (Build.VERSION.SDK_INT >= 21) {
+            try {
+                mTts.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(mScoActive ? AudioAttributes.USAGE_VOICE_COMMUNICATION : AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build());
+            } catch (Exception ignored) {}
         }
         requestAudioFocus();
         int r = mTts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "machi-" + System.currentTimeMillis());
@@ -267,11 +320,23 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == PERMISSION_REQUEST_CODE) {
-            boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            boolean micAsked = false, granted = false;
+            for (int i = 0; i < permissions.length && i < grantResults.length; i++) {
+                if (android.Manifest.permission.RECORD_AUDIO.equals(permissions[i])) {
+                    micAsked = true;
+                    granted = grantResults[i] == PackageManager.PERMISSION_GRANTED;
+                } else if (BT_CONNECT.equals(permissions[i])) {
+                    Log.d(TAG, "BLUETOOTH_CONNECT granted=" + (grantResults[i] == PackageManager.PERMISSION_GRANTED));
+                    refreshRouteLabel();
+                }
+            }
+            if (!micAsked) return;
             Log.d(TAG, "RECORD_AUDIO permission granted=" + granted);
             if (granted && mPendingStartListening) {
                 mPendingStartListening = false;
-                mWebView.post(new Runnable() { @Override public void run() { beginRecognition(mPendingListenLang); } });
+                mWebView.post(new Runnable() { @Override public void run() {
+                    routeAudioThen(new Runnable() { @Override public void run() { beginRecognition(mPendingListenLang); } });
+                } });
             } else if (!granted) {
                 mPendingStartListening = false;
                 evalJs("window.onMachiNativeSpeechError && window.onMachiNativeSpeechError('no_permission');");
@@ -364,9 +429,10 @@ public class MainActivity extends Activity {
             intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
             intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
             // Longer silence windows so quiet / slow speakers are not cut off
-            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2800L);
-            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2400L);
-            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L);
+            // Short enough that Machi answers right after you stop talking, long enough not to cut off soft / slow speech
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L);
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L);
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1000L);
             // Prefer the chosen language but also understand Tamil / Indian & US English words mixed in (Tanglish)
             intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang);
             intent.putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", new String[]{"ta-IN", "en-IN", "en-US"});
@@ -431,7 +497,7 @@ public class MainActivity extends Activity {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                             // USAGE_MEDIA so it follows the media volume slider and plays on the speaker
                             AudioAttributes attributes = new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setUsage(mScoActive ? AudioAttributes.USAGE_VOICE_COMMUNICATION : AudioAttributes.USAGE_MEDIA)
                                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                                 .build();
                             mMediaPlayer.setAudioAttributes(attributes);
@@ -489,14 +555,55 @@ public class MainActivity extends Activity {
                     stopRecognizerQuietly();
                     mPendingTtsText = text;
                     mPendingTtsLang = lang;
+                    mPendingTtsVoice = null;
                     if (mTts != null && mTtsReady) {
                         String t = mPendingTtsText; mPendingTtsText = null;
-                        doSpeakText(t, lang);
+                        doSpeakText(t, lang, null);
                     } else {
-                        ensureTts(new Runnable() { @Override public void run() {} });
+                        ensureTts(null);
                     }
                 }
             });
+        }
+
+        // Same, but with a specific phone voice picked in the app's voice list
+        @JavascriptInterface
+        public void speakTextWithVoice(final String text, final String lang, final String voiceName) {
+            runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    if (text == null || text.trim().isEmpty()) {
+                        evalJs("window.onMachiNativeTtsError && window.onMachiNativeTtsError('empty_text');");
+                        return;
+                    }
+                    releasePlayer();
+                    stopRecognizerQuietly();
+                    mPendingTtsText = text;
+                    mPendingTtsLang = lang;
+                    mPendingTtsVoice = voiceName;
+                    if (mTts != null && mTtsReady) {
+                        String t = mPendingTtsText; mPendingTtsText = null;
+                        doSpeakText(t, lang, voiceName);
+                    } else {
+                        ensureTts(null);
+                    }
+                }
+            });
+        }
+
+        // The app asks for the list of voices installed on this phone
+        @JavascriptInterface
+        public void requestVoices() {
+            runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    if (mTts != null && mTtsReady) pushVoicesToJs(); else ensureTts(null);
+                }
+            });
+        }
+
+        // Called when the conversation / mic is switched off: leave Bluetooth "call" audio and return to normal media audio
+        @JavascriptInterface
+        public void releaseAudioRoute() {
+            runOnUiThread(new Runnable() { @Override public void run() { stopBluetoothCall(); refreshRouteLabel(); } });
         }
 
         @JavascriptInterface
@@ -524,7 +631,9 @@ public class MainActivity extends Activity {
                         }
                         return;
                     }
-                    beginRecognition(language);
+                    // Use whichever mic is active (earbuds / wired headset / phone); Bluetooth needs call-audio routing first
+                    final String lang = language;
+                    routeAudioThen(new Runnable() { @Override public void run() { beginRecognition(lang); } });
                 }
             });
         }
@@ -535,6 +644,153 @@ public class MainActivity extends Activity {
                 @Override public void run() { stopRecognizerQuietly(); }
             });
         }
+    }
+
+    // ===================== Audio routing (built-in mic / wired headset / Bluetooth earbuds) =====================
+    private static boolean isBtInput(int type) { return type == 7 /* BLUETOOTH_SCO */ || type == 26 /* BLE_HEADSET */; }
+    private static boolean isWiredInput(int type) { return type == 3 /* WIRED_HEADSET */ || type == 22 /* USB_HEADSET */ || type == 11 /* USB_DEVICE */; }
+
+    private boolean btAllowed() {
+        return Build.VERSION.SDK_INT < 31 || checkSelfPermission(BT_CONNECT) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private AudioDeviceInfo findInput(boolean bluetooth) {
+        if (mAudioManager == null || Build.VERSION.SDK_INT < 23) return null;
+        try {
+            if (bluetooth && !btAllowed()) return null;
+            for (AudioDeviceInfo d : mAudioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
+                int t = d.getType();
+                if (bluetooth ? isBtInput(t) : isWiredInput(t)) return d;
+            }
+        } catch (Exception e) { Log.w(TAG, "getDevices failed: " + e.getMessage()); }
+        return null;
+    }
+
+    private static String devName(AudioDeviceInfo d) {
+        try { CharSequence n = d.getProductName(); return n == null ? "" : n.toString(); } catch (Exception e) { return ""; }
+    }
+
+    private String currentRouteLabel() {
+        AudioDeviceInfo bt = findInput(true);
+        if (bt != null) return "Bluetooth " + devName(bt);
+        AudioDeviceInfo wired = findInput(false);
+        if (wired != null) return "Wired headset " + devName(wired);
+        return "Phone microphone";
+    }
+
+    private void refreshRouteLabel() {
+        evalJs("window.onMachiNativeRoute && window.onMachiNativeRoute(" + jsStr(currentRouteLabel().trim()) + ");");
+    }
+
+    // Chooses the active input. Bluetooth earbuds only deliver their microphone in "call" (SCO / communication-device)
+    // mode, so switch to that before listening; wired and built-in mics work with the normal route.
+    private void routeAudioThen(final Runnable then) {
+        if (mAudioManager == null || Build.VERSION.SDK_INT < 23) { then.run(); return; }
+        AudioDeviceInfo bt = findInput(true);
+        if (bt != null) {
+            refreshRouteLabel();
+            if (mScoActive) { then.run(); return; }
+            startBluetoothCall(then);
+        } else {
+            if (mScoActive) stopBluetoothCall();
+            refreshRouteLabel();
+            then.run();
+        }
+    }
+
+    private void startBluetoothCall(final Runnable then) {
+        try {
+            mAudioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+            if (Build.VERSION.SDK_INT >= 31) {
+                boolean ok = false;
+                for (AudioDeviceInfo d : mAudioManager.getAvailableCommunicationDevices()) {
+                    if (isBtInput(d.getType())) { ok = mAudioManager.setCommunicationDevice(d); break; }
+                }
+                mScoActive = ok;
+                Log.d(TAG, "Bluetooth communication device set=" + ok);
+                if (!ok) mAudioManager.setMode(AudioManager.MODE_NORMAL);
+                mHandler.postDelayed(then, ok ? 400 : 0); // give the headset a moment to open its mic
+            } else {
+                mScoPending = then;
+                if (mScoReceiver == null) {
+                    mScoReceiver = new BroadcastReceiver() {
+                        @Override public void onReceive(Context c, Intent i) {
+                            int st = i.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1);
+                            if (st == AudioManager.SCO_AUDIO_STATE_CONNECTED) {
+                                mScoActive = true;
+                                Runnable r = mScoPending; mScoPending = null;
+                                if (r != null) { mHandler.removeCallbacks(r); r.run(); }
+                            } else if (st == AudioManager.SCO_AUDIO_STATE_DISCONNECTED) {
+                                mScoActive = false;
+                            }
+                        }
+                    };
+                    registerReceiver(mScoReceiver, new IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED));
+                }
+                mAudioManager.startBluetoothSco();
+                mAudioManager.setBluetoothScoOn(true);
+                // if the headset does not answer, listen with the normal mic rather than hang
+                mHandler.postDelayed(new Runnable() { @Override public void run() {
+                    Runnable r = mScoPending; mScoPending = null;
+                    if (r != null) { Log.w(TAG, "SCO did not connect in time"); r.run(); }
+                } }, 2500);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "startBluetoothCall failed: " + e.getMessage());
+            mScoActive = false;
+            then.run();
+        }
+    }
+
+    private void stopBluetoothCall() {
+        if (mAudioManager == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                mAudioManager.clearCommunicationDevice();
+            } else {
+                mAudioManager.stopBluetoothSco();
+                mAudioManager.setBluetoothScoOn(false);
+            }
+            mAudioManager.setMode(AudioManager.MODE_NORMAL);
+        } catch (Exception e) { Log.w(TAG, "stopBluetoothCall: " + e.getMessage()); }
+        mScoActive = false;
+        mScoPending = null;
+        if (mScoReceiver != null) {
+            try { unregisterReceiver(mScoReceiver); } catch (Exception ignored) {}
+            mScoReceiver = null;
+        }
+    }
+
+    // Sends the phone's installed English / Tamil voices to the app's voice list
+    private void pushVoicesToJs() {
+        if (mTts == null || !mTtsReady || Build.VERSION.SDK_INT < 21) return;
+        try {
+            Set<Voice> all = mTts.getVoices();
+            ArrayList<Voice> list = new ArrayList<Voice>();
+            if (all != null) for (Voice v : all) {
+                String lang = v.getLocale() == null ? "" : v.getLocale().getLanguage();
+                if (lang.equals("en") || lang.equals("ta")) list.add(v);
+            }
+            java.util.Collections.sort(list, new java.util.Comparator<Voice>() {
+                @Override public int compare(Voice a, Voice b) {
+                    int ia = "in".equalsIgnoreCase(a.getLocale().getCountry()) ? 0 : 1;
+                    int ib = "in".equalsIgnoreCase(b.getLocale().getCountry()) ? 0 : 1;
+                    if (ia != ib) return ia - ib;
+                    int c = a.getLocale().toLanguageTag().compareTo(b.getLocale().toLanguageTag());
+                    return c != 0 ? c : a.getName().compareTo(b.getName());
+                }
+            });
+            JSONArray arr = new JSONArray();
+            for (Voice v : list) {
+                if (arr.length() >= 12) break;
+                JSONObject o = new JSONObject();
+                o.put("name", v.getName());
+                o.put("locale", v.getLocale().toLanguageTag());
+                o.put("network", v.isNetworkConnectionRequired());
+                arr.put(o);
+            }
+            evalJs("window.onMachiNativeVoices && window.onMachiNativeVoices(" + jsStr(arr.toString()) + ");");
+        } catch (Exception e) { Log.w(TAG, "pushVoicesToJs failed: " + e.getMessage()); }
     }
 
     private void releasePlayer() {
@@ -574,11 +830,16 @@ public class MainActivity extends Activity {
         if (mSpeechRecognizer != null) {
             try { mSpeechRecognizer.stopListening(); } catch (Exception ignored) {}
         }
+        stopBluetoothCall();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        stopBluetoothCall();
+        if (mRouteCallback != null && mAudioManager != null && Build.VERSION.SDK_INT >= 23) {
+            try { mAudioManager.unregisterAudioDeviceCallback(mRouteCallback); } catch (Exception ignored) {}
+        }
         if (mMediaPlayer != null) {
             try { mMediaPlayer.release(); } catch (Exception ignored) {}
             mMediaPlayer = null;

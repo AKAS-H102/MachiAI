@@ -24,7 +24,9 @@ import {
   Globe,
   Radio
 } from 'lucide-react';
-import { machiVoice, getBackendBaseUrl, isEmbeddedApp, setBackendBaseUrl, VOICE_OPTIONS, getSavedVoice, saveVoice } from './utils/machiVoice.ts';
+import { machiVoice, getBackendBaseUrl, isEmbeddedApp, setBackendBaseUrl, VOICE_OPTIONS, getSavedVoice, saveVoice, parsePhoneVoices, isPhoneVoice } from './utils/machiVoice.ts';
+import type { VoiceOption } from './utils/machiVoice.ts';
+import { parseSse } from '../lib/stream-utils.ts';
 
 interface Message {
   id: string;
@@ -63,6 +65,10 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [volumePercent, setVolumePercent] = useState<number>(125);
   const [selectedVoice, setSelectedVoice] = useState<string>(getSavedVoice());
+  const selectedVoiceRef = useRef<string>(selectedVoice);
+  const [phoneVoices, setPhoneVoices] = useState<VoiceOption[]>([]);
+  const [micRoute, setMicRoute] = useState<string>('');
+  const [firstSentenceShown, setFirstSentenceShown] = useState(false);
   const [activeTab, setActiveTab] = useState<'chat' | 'installers' | 'reminders'>('chat');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
@@ -82,6 +88,7 @@ export default function App() {
 
   const sttReadyTsRef = useRef<number>(Date.now());
   const isLoadingRef = useRef<boolean>(false);
+  selectedVoiceRef.current = selectedVoice; // callbacks registered once (native mic, hands-free) must always see the CURRENT voice
   const handleSendRef = useRef<(t?: string, retry?: boolean) => void>(() => {});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
@@ -140,13 +147,18 @@ export default function App() {
       id: Date.now().toString(), sender: 'machi', text: msg,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     }]);
-    machiVoice.speak(msg, selectedVoice, undefined, () => {
+    machiVoice.speak(msg, selectedVoiceRef.current, undefined, () => {
       if (isHandsFreeRef.current) setTimeout(() => startListeningAction(), 500);
     });
   };
 
   const setupNativeAndroidCallbacks = () => {
     if (typeof window === 'undefined') return;
+
+    (window as any).onMachiNativeVoices = (json: string) => setPhoneVoices(parsePhoneVoices(json));
+    (window as any).onMachiNativeRoute = (label: string) => setMicRoute(label || '');
+    machiVoice.onVoiceStatus = (msg) => setVoiceError(msg);
+    try { (window as any).MachiAndroid?.requestVoices?.(); } catch {}
 
     (window as any).onMachiNativeSpeechStart = () => {
       setIsListening(true);
@@ -342,6 +354,9 @@ export default function App() {
     if (nativeBridge && typeof nativeBridge.stopListening === 'function') {
       try { nativeBridge.stopListening(); } catch {}
     }
+    if (resetHandsFree && nativeBridge && typeof nativeBridge.releaseAudioRoute === 'function') {
+      try { nativeBridge.releaseAudioRoute(); } catch {}
+    }
 
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch {}
@@ -399,6 +414,7 @@ export default function App() {
       if (!textToSend) setInputText('');
     }
     isLoadingRef.current = true; // synchronous guard: blocks a second request before React re-renders
+    setFirstSentenceShown(false);
     setIsLoading(true);
 
     const showError = (detail: string) => {
@@ -430,7 +446,94 @@ export default function App() {
       lastAlternativesRef.current = [];
       const body = JSON.stringify({ message: text, conversationHistory: history, alternatives, languagePreference: speechLanguage });
 
-      // The free Render server sleeps when idle and can need ~50s to wake up, so allow 60s, and retry once on a
+      // ---------- Real-time path: stream the reply and start SPEAKING after the first sentence ----------
+      const finishHandsFree = () => {
+        if (isHandsFreeRef.current) {
+          setTimeout(() => {
+            if (isHandsFreeRef.current && !machiVoice.getSpeakingState()) startListeningAction();
+          }, 400);
+        }
+      };
+      const runStream = async (): Promise<'done' | 'fallback'> => {
+        const controller = new AbortController();
+        // first sentence may need a cold start (free server) -> 45s; once flowing, 20s of silence = stalled
+        let timer = setTimeout(() => controller.abort(), 45000);
+        let speech: ReturnType<typeof machiVoice.beginStream> | null = null;
+        const msgId = (Date.now() + 1).toString();
+        let sawSentence = false;
+        let doneEvt: any = null;
+        let errorText: string | null = null;
+        try {
+          console.log(`[Machi] POST ${baseUrl}/api/machi/chat/stream`);
+          const res = await fetch(`${baseUrl}/api/machi/chat/stream`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+            signal: controller.signal
+          });
+          if (!res.ok || !res.body) { console.warn(`[Machi] stream HTTP ${res.status} -> using standard endpoint`); return 'fallback'; }
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = '';
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            clearTimeout(timer);
+            timer = setTimeout(() => controller.abort(), 20000);
+            buf += decoder.decode(value, { stream: true });
+            const parsed = parseSse(buf);
+            buf = parsed.rest;
+            for (const ev of parsed.events) {
+              if (ev.type === 'sentence' && typeof ev.text === 'string' && ev.text.trim()) {
+                if (!sawSentence) {
+                  sawSentence = true;
+                  console.log(`[Machi Timing] first_sentence=${Date.now() - reqStart}ms`);
+                  setFirstSentenceShown(true);
+                  setMessages(prev => [...prev, { id: msgId, sender: 'machi', text: ev.text, timestamp: stamp() }]);
+                  speech = machiVoice.beginStream(selectedVoiceRef.current, undefined, finishHandsFree);
+                } else {
+                  setMessages(prev => prev.map(m => m.id === msgId ? { ...m, text: m.text + ' ' + ev.text } : m));
+                }
+                speech!.push(ev.text);
+              } else if (ev.type === 'done') {
+                doneEvt = ev;
+              } else if (ev.type === 'error') {
+                errorText = String(ev.error || 'The AI service did not answer.');
+              }
+            }
+          }
+        } catch (e: any) {
+          console.warn('[Machi] stream problem:', String(e));
+          if (!sawSentence) return 'fallback';
+        } finally {
+          clearTimeout(timer);
+        }
+
+        if (!sawSentence) {
+          if (errorText) { showError(`${errorText} Tap Retry.`); return 'done'; }
+          return 'fallback';
+        }
+        console.log(`[Machi Timing] stream_total=${Date.now() - reqStart}ms server_latency=${doneEvt?.latencyMs}ms model=${doneEvt?.modelUsed}`);
+        setMessages(prev => prev.map(m => m.id === msgId
+          ? { ...m, intent: doneEvt?.intent, sources: doneEvt?.sources, latencyMs: doneEvt?.latencyMs, modelUsed: doneEvt?.modelUsed }
+          : m));
+        if (doneEvt?.intent === 'create_reminder' && doneEvt.actionData?.reminderTitle) {
+          setReminders(prev => [...prev, {
+            id: Date.now().toString(),
+            title: doneEvt.actionData.reminderTitle,
+            time: doneEvt.actionData.reminderTime || 'Later today'
+          }]);
+        }
+        speech!.end().then(ok => {
+          if (!ok) setVoiceError('Voice playback failed - the reply is shown as text. Use "Replay voice" to retry.');
+        });
+        return 'done';
+      };
+      const streamed = await runStream();
+      if (streamed === 'done') return;
+
+      // Streaming unavailable -> standard request (same real AI, whole reply at once).
+      // The free Render server sleeps when idle and can need ~50s to wake up, so allow 45s, and retry once on a
       // network error / 502 / 503 / timeout instead of immediately showing an error.
       let response: Response | null = null;
       let lastNetErr: any = null;
@@ -512,8 +615,8 @@ export default function App() {
       };
 
       const spoken = (data.sentences && Array.isArray(data.sentences) && data.sentences.length > 0)
-        ? machiVoice.speakPipelined(data.sentences, selectedVoice, undefined, onPlaybackFinished)
-        : machiVoice.speak(machiReply, selectedVoice, undefined, onPlaybackFinished);
+        ? machiVoice.speakPipelined(data.sentences, selectedVoiceRef.current, undefined, onPlaybackFinished)
+        : machiVoice.speak(machiReply, selectedVoiceRef.current, undefined, onPlaybackFinished);
       spoken.then(ok => {
         if (!ok) setVoiceError('Voice playback failed - the reply is shown as text. Use "Replay voice" to retry.');
       });
@@ -555,7 +658,17 @@ export default function App() {
           ? 'text-[11px] font-mono px-2 py-0.5 rounded bg-slate-900 text-cyan-300 border border-cyan-800/60 max-w-[200px]'
           : 'w-full py-2 px-2.5 rounded-lg text-xs bg-slate-900 text-cyan-300 border border-cyan-800/60'}
       >
-        {VOICE_OPTIONS.map(v => <option key={v.id} value={v.id}>{v.label} - {v.note}</option>)}
+        <optgroup label="Machi voices (server)">
+          {VOICE_OPTIONS.map(v => <option key={v.id} value={v.id}>{v.label} - {v.note}</option>)}
+        </optgroup>
+        {phoneVoices.length > 0 && (
+          <optgroup label="Phone voices (work offline)">
+            {phoneVoices.map(v => <option key={v.id} value={v.id}>{v.label} - {v.note}</option>)}
+          </optgroup>
+        )}
+        {isPhoneVoice(selectedVoice) && !phoneVoices.some(v => v.id === selectedVoice) && (
+          <option value={selectedVoice}>Saved phone voice</option>
+        )}
       </select>
       {!compact && (
         <p className="text-[10px] text-slate-500 leading-snug">If the chosen neural voice is busy, Machi briefly uses a backup voice so you never get silence.</p>
@@ -1038,6 +1151,9 @@ export default function App() {
                       : "Tap button above to begin speaking"}
                   </p>
                 )}
+                {micRoute && (
+                  <p className="text-[10px] font-mono text-slate-500">Audio: {micRoute}</p>
+                )}
 
                 {/* Language Mode Toggle Badge */}
                 <div className="flex items-center gap-1.5 pt-0.5">
@@ -1155,7 +1271,7 @@ export default function App() {
                   <button className="underline cursor-pointer" onClick={() => setVoiceError(null)}>dismiss</button>
                 </div>
               )}
-              {isLoading && (
+              {isLoading && !firstSentenceShown && (
                 <div className="flex flex-col items-start">
                   <div className="bg-slate-900/80 border border-cyan-800/40 rounded-2xl px-4 py-3 rounded-tl-sm">
                     <div className="flex items-center gap-2 text-xs text-cyan-400">

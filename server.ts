@@ -4,6 +4,7 @@ import { GoogleGenAI } from "@google/genai";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import dotenv from "dotenv";
 import { hedgedRace, DeadList, errorCode } from "./lib/race.ts";
+import { takeSentences, cleanForSpeech } from "./lib/stream-utils.ts";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -107,9 +108,73 @@ function callWithTimeout<T>(promise: Promise<T>, timeoutMs: number, label: strin
   return Promise.race([
     promise,
     new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout of ${timeoutMs}ms exceeded on ${label}`)), timeoutMs)
+      setTimeout(() => reject(Object.assign(new Error(`Timeout of ${timeoutMs}ms exceeded on ${label}`), { code: "timeout" })), timeoutMs)
     )
   ]);
+}
+
+function reminderFastPath(trimmed: string, lower: string): { reply: string; intent: string; actionData: Record<string, any> } | null {
+  if (!(lower.startsWith("remind") || lower.includes("remind pannu") || lower.includes("reminder"))) return null;
+  const title = trimmed.replace(/remind me to|remind pannu|reminder/i, "").trim() || "Call Friend";
+  const timeMatch = trimmed.match(/(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/i);
+  const timeStr = timeMatch ? timeMatch[0] : "In 30 minutes";
+  const reply = `Okay da machi! Reminder set panniten. ${timeStr}-ku "${title}" kandippa remind panren.`;
+  return { reply, intent: "create_reminder", actionData: { reminderTitle: title, reminderTime: timeStr } };
+}
+
+function buildContents(conversationHistory: any, trimmed: string, context: any, alternatives: any): any[] {
+  const lower = trimmed.toLowerCase();
+  const contents: any[] = [];
+  if (Array.isArray(conversationHistory)) {
+    for (const turn of conversationHistory.slice(-8)) {
+      if (turn && typeof turn.user === "string" && turn.user.trim()) contents.push({ role: "user", parts: [{ text: turn.user.slice(0, 2000) }] });
+      if (turn && typeof turn.machi === "string" && turn.machi.trim()) contents.push({ role: "model", parts: [{ text: turn.machi.slice(0, 2000) }] });
+    }
+    // Gemini requires the first turn to be from the user
+    while (contents.length && contents[0].role !== "user") contents.shift();
+  }
+  const conversationContext = context ? `Context: ${JSON.stringify(context)}\n` : "";
+  const alts = Array.isArray(alternatives)
+    ? alternatives.filter((x: any) => typeof x === "string" && x.trim() && x.trim().toLowerCase() !== lower).slice(0, 3).map((x: string) => x.slice(0, 300))
+    : [];
+  const altNote = alts.length
+    ? `\n(Voice input. The speech recognizer may have misheard a soft or unclear voice. Other possible transcripts: ${alts.map(a => `"${a}"`).join(" | ")}. Reply to what the user most plausibly meant.)`
+    : "";
+  contents.push({ role: "user", parts: [{ text: `${conversationContext}User says: "${trimmed}"${altNote}` }] });
+  return contents;
+}
+
+// ---- Model discovery: ask Google which models THIS key can use, so a retired model never silently breaks chat/voice ----
+let discovered: { chat: string[]; tts: string[]; at: number; error?: string } = { chat: [], tts: [], at: 0 };
+const versionOf = (n: string) => parseFloat((n.match(/(\d+(?:\.\d+)?)/) || [])[1] || "0");
+async function discoverModels(force = false) {
+  if (!apiKey) return discovered;
+  if (!force && Date.now() - discovered.at < 30 * 60 * 1000) return discovered;
+  discovered = { ...discovered, at: Date.now() }; // avoid a stampede of parallel listings
+  try {
+    const pager: any = await ai.models.list({ config: { pageSize: 100 } });
+    const chat: string[] = [], tts: string[] = [];
+    for await (const m of pager) {
+      const name = String(m?.name || "").replace(/^models\//, "");
+      const actions: string[] = m?.supportedActions || m?.supportedGenerationMethods || [];
+      if (actions.length && !actions.includes("generateContent")) continue;
+      if (/tts/i.test(name)) tts.push(name);
+      else if (/flash/i.test(name) && !/(image|live|audio|embed|robot|computer|native|exp|8b|vision)/i.test(name)) chat.push(name);
+    }
+    const rank = (a: string, b: string) => versionOf(b) - versionOf(a) || a.length - b.length;
+    discovered = { chat: chat.sort(rank), tts: tts.sort(rank), at: Date.now() };
+    console.log(`[Machi] discovered models chat=[${discovered.chat.slice(0, 5).join(", ")}] tts=[${discovered.tts.slice(0, 5).join(", ")}]`);
+  } catch (e: any) {
+    discovered = { ...discovered, error: String(e?.message || e).slice(0, 200) };
+    console.warn("[Machi] model discovery failed:", discovered.error);
+  }
+  return discovered;
+}
+const sleepMs = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+async function getChatModels(): Promise<string[]> {
+  await Promise.race([discoverModels(), sleepMs(1500)]);
+  const extra = discovered.chat.filter(m => !CANDIDATE_MODELS.includes(m)).slice(0, 2);
+  return [...CANDIDATE_MODELS, ...extra];
 }
 
 const CHAT_HEDGE_MS = parseInt(process.env.CHAT_HEDGE_MS || "5000", 10);
@@ -136,7 +201,8 @@ async function callModel(modelName: string, contents: any[], baseConfig: any) {
 // Starts the first model; if it is slow (CHAT_HEDGE_MS) or fails, the next model starts in parallel. First good answer wins.
 // Models that answered 404 (retired) are skipped for 30 minutes instead of costing time on every message.
 async function generateGeminiContentWithFastFallback(contents: any[], baseConfig: any) {
-  const tasks = deadModels.live(CANDIDATE_MODELS.map(name => ({ name, run: () => callModel(name, contents, baseConfig) })));
+  const chatModels = await getChatModels();
+  const tasks = deadModels.live(chatModels.map(name => ({ name, run: () => callModel(name, contents, baseConfig) })));
   try {
     const r = await hedgedRace(tasks, {
       hedgeMs: CHAT_HEDGE_MS,
@@ -174,63 +240,11 @@ app.post("/api/machi/chat", async (req, res) => {
     const trimmed = message.trim();
     const lower = trimmed.toLowerCase();
 
-    // Fast-path instant intent matching (sub-millisecond latency)
-    if (lower.startsWith("remind") || lower.includes("remind pannu") || lower.includes("reminder")) {
-      const title = trimmed.replace(/remind me to|remind pannu|reminder/i, "").trim() || "Call Friend";
-      const timeMatch = trimmed.match(/(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/i);
-      const timeStr = timeMatch ? timeMatch[0] : "In 30 minutes";
-      const reply = `Okay da machi! Reminder set panniten. ${timeStr}-ku "${title}" kandippa remind panren.`;
-      return res.json({
-        reply,
-        sentences: splitIntoSentences(reply),
-        intent: "create_reminder",
-        actionData: { reminderTitle: title, reminderTime: timeStr },
-        latencyMs: Date.now() - startTime
-      });
-    }
-
-    if (lower.includes("notification") || lower.includes("enna notification")) {
-      const reply = "Hey machi, ungalukku recent-ah notifications vandhurukku. WhatsApp and messages check pannalaama?";
-      return res.json({
-        reply,
-        sentences: splitIntoSentences(reply),
-        intent: "query_notifications",
-        actionData: {},
-        latencyMs: Date.now() - startTime
-      });
-    }
-
-    if (lower.includes("attend the call") || lower.includes("attend call") || lower.includes("pick up the call") || lower.includes("answer the call")) {
-      const reply = "Seri machi, call attend panren da!";
-      return res.json({
-        reply,
-        sentences: splitIntoSentences(reply),
-        intent: "attend_call",
-        actionData: {},
-        latencyMs: Date.now() - startTime
-      });
-    }
-
-    if (lower.includes("reject the call") || lower.includes("reject call") || lower.includes("cut pannu")) {
-      const reply = "Call reject panniyachu machi.";
-      return res.json({
-        reply,
-        sentences: splitIntoSentences(reply),
-        intent: "reject_call",
-        actionData: {},
-        latencyMs: Date.now() - startTime
-      });
-    }
-
-    if (trimmed === "Hi Machi" || trimmed === "Hey Machi" || trimmed === "Hai Machi" || trimmed === "Machi") {
-      const reply = "Hey machi, sollu da! Enna help venum? Ready-ah iruken.";
-      return res.json({
-        reply,
-        sentences: splitIntoSentences(reply),
-        intent: "chat",
-        actionData: {},
-        latencyMs: Date.now() - startTime
-      });
+    // Only the reminder shortcut stays: it really creates a reminder in the app. Everything else (greetings,
+    // notifications, calls...) goes to the real AI - no canned replies that pretend to have done something.
+    const fast = reminderFastPath(trimmed, lower);
+    if (fast) {
+      return res.json({ ...fast, sentences: splitIntoSentences(fast.reply), latencyMs: Date.now() - startTime });
     }
 
     if (!apiKey) {
@@ -238,24 +252,7 @@ app.post("/api/machi/chat", async (req, res) => {
       return res.status(503).json({ error: "AI provider is not configured on the server (missing GEMINI_API_KEY)." });
     }
 
-    const contents: any[] = [];
-    if (Array.isArray(conversationHistory)) {
-      for (const turn of conversationHistory.slice(-8)) {
-        if (turn && typeof turn.user === "string" && turn.user.trim()) contents.push({ role: "user", parts: [{ text: turn.user.slice(0, 2000) }] });
-        if (turn && typeof turn.machi === "string" && turn.machi.trim()) contents.push({ role: "model", parts: [{ text: turn.machi.slice(0, 2000) }] });
-      }
-      // Gemini requires the first turn to be from the user
-      while (contents.length && contents[0].role !== "user") contents.shift();
-    }
-
-    const conversationContext = context ? `Context: ${JSON.stringify(context)}\n` : "";
-    const alts = Array.isArray(alternatives)
-      ? alternatives.filter((x: any) => typeof x === "string" && x.trim() && x.trim().toLowerCase() !== lower).slice(0, 3).map((x: string) => x.slice(0, 300))
-      : [];
-    const altNote = alts.length
-      ? `\n(Voice input. The speech recognizer may have misheard a soft or unclear voice. Other possible transcripts: ${alts.map(a => `"${a}"`).join(" | ")}. Reply to what the user most plausibly meant.)`
-      : "";
-    contents.push({ role: "user", parts: [{ text: `${conversationContext}User says: "${trimmed}"${altNote}` }] });
+    const contents = buildContents(conversationHistory, trimmed, context, alternatives);
 
     const needsSearch = requiresWebSearch(trimmed);
     const config: any = {
@@ -338,57 +335,122 @@ app.post("/api/machi/chat", async (req, res) => {
   }
 });
 
-// Real-time streaming SSE endpoint
-app.get("/api/machi/chat/stream", async (req, res) => {
-  const message = req.query.message as string;
-  if (!message) {
-    return res.status(400).send("Message is required");
+// ---------- Real-time streaming chat ----------
+// Same persona as /chat but plain text, streamed. Each complete sentence is sent immediately so the app can start
+// speaking after the FIRST sentence instead of waiting for the whole reply (phone-call feel).
+const STREAM_FIRST_CHUNK_MS = parseInt(process.env.STREAM_FIRST_CHUNK_MS || "7000", 10);
+const STREAM_SYSTEM_PROMPT = MACHI_SYSTEM_PROMPT.slice(0, MACHI_SYSTEM_PROMPT.indexOf("4. ACTIONS & INTENTS")) + `
+OUTPUT FORMAT: Reply with plain spoken text ONLY - no JSON, no markdown, no bullet points, no emojis. Use 2-3 short natural sentences unless the user asks for detail. The text is read aloud, so write it exactly as it should be spoken. The user is talking by voice and the speech recognizer can mishear: answer what they most plausibly meant.`;
+
+async function openStreamAndFirstChunk(modelName: string, contents: any[], baseConfig: any) {
+  const attempt = async (config: any) => {
+    const work = (async () => {
+      const stream: any = await ai.models.generateContentStream({ model: modelName, contents, config });
+      const it = stream[Symbol.asyncIterator]();
+      const first = await it.next();
+      return { it, first };
+    })();
+    return await callWithTimeout(work, STREAM_FIRST_CHUNK_MS, modelName);
+  };
+  const useThinking = THINKING_BUDGET !== "off" && !noThinkingModels.has(modelName);
+  try {
+    return await attempt(useThinking ? { ...baseConfig, thinkingConfig: { thinkingBudget: parseInt(THINKING_BUDGET, 10) || 0 } } : baseConfig);
+  } catch (err: any) {
+    if (useThinking && errorCode(err) === "400" && /think/i.test(String(err?.message))) {
+      noThinkingModels.add(modelName);
+      return await attempt(baseConfig);
+    }
+    throw err;
   }
+}
 
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-
+app.post("/api/machi/chat/stream", async (req, res) => {
+  const startTime = Date.now();
+  const { message, conversationHistory = [], context, alternatives } = req.body || {};
+  if (!message || typeof message !== "string" || !message.trim()) {
+    return res.status(400).json({ error: "Message is required" });
+  }
   const trimmed = message.trim();
   const lower = trimmed.toLowerCase();
 
-  if (!apiKey) {
-    res.write(`data: ${JSON.stringify({ error: "AI provider is not configured on the server.", done: true })}\n\n`);
-    return res.end();
-  }
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  (res as any).flushHeaders?.();
+  let clientGone = false;
+  res.on("close", () => { if (!res.writableEnded) clientGone = true; });
+  const send = (o: any) => { try { res.write(`data: ${JSON.stringify(o)}\n\n`); } catch {} };
+  const finish = () => { try { res.end(); } catch {} };
 
-  for (const modelName of CANDIDATE_MODELS) {
-    try {
-      const stream = await callWithTimeout(
-        ai.models.generateContentStream({
-          model: modelName,
-          contents: [{ role: "user", parts: [{ text: `User: "${trimmed}". Reply directly as Machi, friendly male friend, in 2 short sentences.` }] }],
-          config: {
-            systemInstruction: "You are Machi, a fast, knowledgeable male friend. Answer the user directly, concisely in Tanglish/English.",
-            temperature: 0.6
+  try {
+    const fast = reminderFastPath(trimmed, lower);
+    if (fast) {
+      for (const sentence of splitIntoSentences(fast.reply)) send({ type: "sentence", text: sentence });
+      send({ type: "done", ...fast, latencyMs: Date.now() - startTime });
+      return finish();
+    }
+    if (!apiKey) {
+      send({ type: "error", error: "AI provider is not configured on the server (missing GEMINI_API_KEY)." });
+      return finish();
+    }
+
+    const contents = buildContents(conversationHistory, trimmed, context, alternatives);
+    const needsSearch = requiresWebSearch(trimmed);
+    const config: any = { systemInstruction: STREAM_SYSTEM_PROMPT, temperature: 0.6, maxOutputTokens: 1024 };
+    if (needsSearch) config.tools = [{ googleSearch: {} }];
+
+    const models = deadModels.live((await getChatModels()).map(name => ({ name })));
+    const codes: string[] = [];
+
+    for (const { name: modelName } of models) {
+      if (clientGone) return;
+      let full = "", buffer = "", emitted = 0;
+      const sources: { title: string; url: string }[] = [];
+      try {
+        const { it, first } = await openStreamAndFirstChunk(modelName, contents, config);
+        let result: any = first;
+        while (!result.done) {
+          const chunk = result.value;
+          const piece: string = chunk?.text || "";
+          for (const c of chunk?.candidates?.[0]?.groundingMetadata?.groundingChunks || []) {
+            if (c.web?.uri && sources.length < 3) sources.push({ title: c.web.title || new URL(c.web.uri).hostname, url: c.web.uri });
           }
-        }),
-        CHAT_TIMEOUT_MS,
-        modelName
-      );
-
-      let accumulated = "";
-      for await (const chunk of stream) {
-        const text = chunk.text || "";
-        if (text) {
-          accumulated += text;
-          res.write(`data: ${JSON.stringify({ chunk: text, done: false })}\n\n`);
+          if (piece) {
+            full += piece; buffer += piece;
+            const r = takeSentences(buffer, false);
+            buffer = r.rest;
+            for (const sentence of r.sentences) { send({ type: "sentence", text: sentence }); emitted++; }
+          }
+          if (clientGone) return;
+          result = await callWithTimeout(it.next(), CHAT_TIMEOUT_MS, modelName); // idle timeout between chunks
+        }
+        for (const sentence of takeSentences(buffer, true).sentences) { send({ type: "sentence", text: sentence }); emitted++; }
+        if (!full.trim()) throw new Error("empty answer");
+        console.log(`[Machi] stream ok model=${modelName} search=${needsSearch} first-sentence+total=${Date.now() - startTime}ms`);
+        send({ type: "done", reply: cleanForSpeech(full), intent: needsSearch ? "information" : "chat", actionData: {}, sources, searchUsed: needsSearch, modelUsed: modelName, latencyMs: Date.now() - startTime });
+        return finish();
+      } catch (err: any) {
+        const code = errorCode(err);
+        codes.push(code);
+        console.error(`[Machi] Stream model ${modelName} FAILED (${code}): ${String(err?.message || err).slice(0, 200)}`);
+        if (code === "404") deadModels.mark(modelName);
+        if (emitted > 0) {
+          // Part of the answer was already sent (and is being spoken): end it cleanly rather than switching model mid-sentence.
+          const tail = takeSentences(buffer, true).sentences;
+          for (const sentence of tail) send({ type: "sentence", text: sentence });
+          send({ type: "done", reply: cleanForSpeech(full), intent: "chat", actionData: {}, sources, modelUsed: modelName, partial: true, latencyMs: Date.now() - startTime });
+          return finish();
         }
       }
-      res.write(`data: ${JSON.stringify({ done: true, fullReply: accumulated })}\n\n`);
-      return res.end();
-    } catch (e: any) {
-      console.log(`[Machi Stream] Model ${modelName} stream exception: ${e?.message?.slice(0, 60)}, cascading...`);
     }
+    send({ type: "error", error: explainAiFailure(codes) });
+    return finish();
+  } catch (e: any) {
+    console.error("[Machi] stream handler error:", e?.message || e);
+    send({ type: "error", error: "Unexpected server error while generating the reply." });
+    return finish();
   }
-
-  res.write(`data: ${JSON.stringify({ error: "The AI service is temporarily unavailable.", done: true })}\n\n`);
-  return res.end();
 });
 
 function formatConversationalText(raw: string): string {
@@ -531,6 +593,13 @@ function pcmToWavBase64(pcmBase64: string, sampleRate = 24000, channels = 1, bit
 const TTS_MODELS = (process.env.GEMINI_TTS_MODELS || "gemini-2.5-flash-preview-tts,gemini-2.5-flash-lite-preview-tts")
   .split(",").map(m => m.trim()).filter(Boolean);
 const deadTtsModels = new DeadList();
+let lastTtsFailures: string[] = [];
+async function getTtsModels(): Promise<string[]> {
+  await Promise.race([discoverModels(), sleepMs(1500)]);
+  // If GEMINI_TTS_MODELS is set it wins; otherwise models Google reports for this key go first (defaults may be retired)
+  const list = process.env.GEMINI_TTS_MODELS ? [...TTS_MODELS, ...discovered.tts] : [...discovered.tts, ...TTS_MODELS];
+  return Array.from(new Set(list));
+}
 const TTS_HEDGE_MS = parseInt(process.env.TTS_HEDGE_MS || "3500", 10);
 
 async function geminiTtsOnce(modelName: string, text: string, voiceName: string) {
@@ -569,7 +638,8 @@ async function executeSpeechSynthesis(text: string, preferredVoice?: string, rat
         return { ...r, usedFallback: fallback };
       },
     });
-    const geminiTasks = TTS_MODELS.filter(m => !deadTtsModels.isDead(m)).map(m => ({
+    const ttsModels = (await getTtsModels()).filter(m => !deadTtsModels.isDead(m)).slice(0, 4);
+    const geminiTasks = ttsModels.map(m => ({
       name: m, run: () => geminiTtsOnce(m, cleanText, gemVoice),
     }));
 
@@ -588,10 +658,12 @@ async function executeSpeechSynthesis(text: string, preferredVoice?: string, rat
         },
       });
       const result = r.value;
+      lastTtsFailures = [];
       if (!result.usedFallback) setCachedTTS(cacheKey, result); // never cache a fallback voice
       return result;
     } catch (e: any) {
-      console.error("[Machi TTS] all engines failed:", (e?.failures || []).map((f: any) => `${f.name}:${f.code}`).join(", "));
+      lastTtsFailures = (e?.failures || []).map((f: any) => `${f.name}: ${f.code} ${f.message}`.slice(0, 200));
+      console.error("[Machi TTS] all engines failed:", lastTtsFailures.join(" | "));
       return null;
     }
   })();
@@ -622,7 +694,8 @@ app.post("/api/machi/tts", async (req, res) => {
     }
 
     return res.status(503).json({
-      error: "Neural voice synthesis is temporarily busy. Please retry.",
+      error: "Neural voice synthesis is unavailable right now.",
+      details: lastTtsFailures,
       circuitBreakerActive: Date.now() < edgeTtsCooldownUntil
     });
   } catch (err: any) {
@@ -630,11 +703,55 @@ app.post("/api/machi/tts", async (req, res) => {
   }
 });
 
+// ---------- Diagnostics: open /api/machi/diag in a browser to see exactly which AI / voice engines work ----------
+let diagCache: { at: number; data: any } | null = null;
+async function timedTest(name: string, fn: () => Promise<any>) {
+  const t0 = Date.now();
+  try {
+    const r: any = await fn();
+    const bytes = r?.audioBase64 ? Math.round(r.audioBase64.length * 0.75) : undefined;
+    return { name, ok: true, ms: Date.now() - t0, ...(bytes ? { bytes } : {}) };
+  } catch (e: any) {
+    return { name, ok: false, ms: Date.now() - t0, code: errorCode(e), error: String(e?.message || e).slice(0, 220) };
+  }
+}
+app.get("/api/machi/diag", async (_req, res) => {
+  if (diagCache && Date.now() - diagCache.at < 60000) return res.json({ ...diagCache.data, cached: true });
+  const data: any = { geminiConfigured: !!apiKey, serverTime: new Date().toISOString(), tests: [] };
+  if (apiKey) {
+    await discoverModels(true);
+    data.discovered = { chat: discovered.chat.slice(0, 8), tts: discovered.tts.slice(0, 8), listError: discovered.error };
+    data.configuredChatModels = CANDIDATE_MODELS;
+    const chatList = (await getChatModels()).slice(0, 3);
+    const ttsList = (await getTtsModels()).slice(0, 3);
+    const jobs: Promise<any>[] = [];
+    for (const m of chatList) jobs.push(timedTest(`chat:${m}`, () => callWithTimeout(callModel(m, [{ role: "user", parts: [{ text: "Say hi in one word" }] }], { maxOutputTokens: 64 }), 15000, m)));
+    for (const m of ttsList) jobs.push(timedTest(`gemini-voice(Puck):${m}`, () => callWithTimeout(geminiTtsOnce(m, "Hello machi, this is a voice test.", "Puck"), 15000, m)));
+    jobs.push(timedTest("edge-voice(Guy)", async () => {
+      const r = await synthesizeWithEdgeTTS("Hello machi, this is a voice test.", "Guy");
+      if (!r) throw new Error("Edge TTS returned nothing (cooldown after errors, or blocked) - see server logs");
+      return r;
+    }));
+    data.tests = await Promise.all(jobs);
+    const ok = (prefix: string) => data.tests.some((t: any) => t.ok && t.name.startsWith(prefix));
+    data.verdict = {
+      chat: ok("chat:") ? "OK" : "FAILING - no chat model answered",
+      geminiVoices: ok("gemini-voice") ? "OK (Puck/Charon work)" : "FAILING - Puck/Charon unavailable; the app uses a backup voice",
+      edgeVoices: ok("edge-voice") ? "OK (Guy/Andrew/Brian/Prabhat/Valluvar/Pallavi work)" : "FAILING - Edge voices unavailable from this server",
+      phoneVoiceFallback: !ok("gemini-voice") && !ok("edge-voice") ? "YES - every reply will be spoken by the phone's own voice" : "no",
+    };
+  } else {
+    data.verdict = { chat: "FAILING - GEMINI_API_KEY missing" };
+  }
+  diagCache = { at: Date.now(), data };
+  res.json(data);
+});
+
 app.get("/api/machi/status", (_req, res) => {
   res.json({
     status: "online",
     assistant: "Machi (JARVIS Fast Pipeline Edition)",
-    version: "1.6.0",
+    version: "1.7.0",
     capabilities: [
       "Sub-Second Intent Execution",
       "Pipelined Sentence TTS",
@@ -651,6 +768,7 @@ app.get("/api/machi/status", (_req, res) => {
 app.use("/release", express.static(path.resolve(__dirname, "release")));
 
 async function startServer() {
+  discoverModels().catch(() => {});
   const isProd = process.env.NODE_ENV === "production";
   const httpServer = http.createServer(app);
 

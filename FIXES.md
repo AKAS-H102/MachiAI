@@ -53,3 +53,19 @@ APK run, microphone accuracy. See the chat summary for the checklist.
 - Soft speech: longer silence tolerance, 5 candidate transcripts, Tamil/English additional languages, low-confidence
   results are no longer rejected (only near-empty ones), and the alternatives are sent to the AI to resolve mishearing.
 - render.yaml: CHAT_TIMEOUT_MS=25000, CHAT_HEDGE_MS=5000.
+
+---
+# Round 4: real-time voice, voice selection, Bluetooth/wired mic, diagnostics
+Tests run here (all against SIMULATED providers - no network): race 7/7, TTS chunking 6/6, stream helpers 10/10,
+client speech session 10/10, server end-to-end with fake Google/Edge 20/20; MainActivity.java compiles against android.jar.
+NOT tested: real Gemini/Edge calls, real phone, real earbuds, real microphone, APK install.
+- Root cause of "always the same female voice": when both server voice engines fail the app silently fell back to the
+  phone's default Android voice. Now: the app tells you when that happens, phone voices are selectable in the picker
+  (they work offline), models are auto-discovered from the API key, and /api/machi/diag shows which engine fails.
+- Real-time: new POST /api/machi/chat/stream. The reply streams sentence by sentence; speech starts after the first
+  sentence. If streaming is unavailable the app falls back to the normal endpoint (still the real AI).
+- Removed canned replies (greeting / notifications / call attend / reject) that pretended to act; only the reminder
+  shortcut (which really creates a reminder) remains.
+- Android audio: Bluetooth (SCO / communication device), wired and built-in mic detection with BLUETOOTH_CONNECT
+  permission; call-style routing while listening, released when the mic is turned off or the app backgrounds.
+- Speech end detection 1.5s/1.2s (was 2.8s/2.4s) so answers start sooner.

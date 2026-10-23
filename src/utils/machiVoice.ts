@@ -1,3 +1,4 @@
+import { takeSentences } from '../../lib/stream-utils.ts';
 // Machi Locked Voice Service
 // Locked Voice: Gemini Puck Neural TTS (Primary) with Microsoft Edge en-US-GuyNeural / ta-IN-ValluvarNeural (Secondary)
 // Dual Pipeline: Android Native MediaPlayer (in APK) & HTML5 Audio (in Browser)
@@ -40,10 +41,25 @@ export function chunkSentences(sentences: string[], firstMax: number = 140, rest
   return out;
 }
 
+// Voices built into the phone (Android TextToSpeech). These work with no server at all, so a chosen voice always changes.
+export const PHONE_VOICE_PREFIX = 'phone:';
+export const isPhoneVoice = (id: string) => typeof id === 'string' && id.startsWith(PHONE_VOICE_PREFIX);
+
+export function parsePhoneVoices(json: string): VoiceOption[] {
+  try {
+    const list: { name: string; locale: string; network?: boolean }[] = JSON.parse(json);
+    return list.slice(0, 12).map((v, i) => ({
+      id: PHONE_VOICE_PREFIX + v.name,
+      label: `Phone voice ${i + 1} (${v.locale})`,
+      note: v.network ? 'built-in, online' : 'built-in, offline'
+    }));
+  } catch { return []; }
+}
+
 export function getSavedVoice(): string {
   try {
     const v = localStorage.getItem('machi_voice') || '';
-    if (VOICE_OPTIONS.some(o => o.id === v)) return v;
+    if (VOICE_OPTIONS.some(o => o.id === v) || isPhoneVoice(v)) return v;
   } catch {}
   return 'Puck';
 }
@@ -101,6 +117,8 @@ class MachiVoiceManager {
   private lastSpeechEndTs: number = 0;
   public lastVoiceUsed: string = '';
   public lastWasFallback: boolean = false;
+  // Tells the UI when the voice you chose could NOT be used (so it never silently sounds different)
+  public onVoiceStatus?: (msg: string | null) => void;
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -199,6 +217,7 @@ class MachiVoiceManager {
   public async fetchAudioPayload(text: string, voicePreference: string = 'Puck'): Promise<AudioPayload | null> {
     const cleanText = text.trim();
     if (!cleanText) return null;
+    if (isPhoneVoice(voicePreference)) return null; // spoken by the phone's own engine
 
     const cacheKey = `${voicePreference}:${cleanText}`;
     const cached = this.audioPayloadCache.get(cacheKey);
@@ -231,6 +250,7 @@ class MachiVoiceManager {
         console.log(`[Machi Voice] TTS ok requested=${voicePreference} used=${data.voice} fallback=${!!data.usedFallback} mime=${mime} bytes~${Math.round(data.audioBase64.length * 0.75)}`);
         this.lastVoiceUsed = data.voice;
         this.lastWasFallback = !!data.usedFallback;
+        this.onVoiceStatus?.(data.usedFallback ? `${voicePreference} is unavailable on the server right now - using backup voice (${data.voice}).` : null);
         const payload: AudioPayload = { base64: data.audioBase64, mimeType: mime, url: URL.createObjectURL(new Blob([byteArray], { type: mime })) };
         this.audioPayloadCache.set(cacheKey, payload);
         return payload;
@@ -362,11 +382,11 @@ class MachiVoiceManager {
         if (payload) {
           const played = await this.playAudio(payload, sessionId);
           if (!played && this.playSessionId === sessionId) {
-            const ok = await this.fallbackBrowserTTS(currentText, sessionId);
+            const ok = await this.fallbackBrowserTTS(currentText, sessionId, isPhoneVoice(voicePreference) ? voicePreference.slice(PHONE_VOICE_PREFIX.length) : undefined);
             if (!ok) anyFailed = true;
           }
         } else {
-          const ok = await this.fallbackBrowserTTS(currentText, sessionId);
+          const ok = await this.fallbackBrowserTTS(currentText, sessionId, isPhoneVoice(voicePreference) ? voicePreference.slice(PHONE_VOICE_PREFIX.length) : undefined);
           if (!ok) anyFailed = true;
         }
       }
@@ -386,6 +406,58 @@ class MachiVoiceManager {
     }
   }
 
+  // Real-time speech: push sentences as the server streams them; playback starts after the FIRST sentence while the
+  // rest are synthesised in parallel. end() resolves when everything has been spoken.
+  public beginStream(voicePreference: string = 'Puck', onStart?: () => void, onEnd?: () => void) {
+    this.stop();
+    const sessionId = ++this.playSessionId;
+    this.setSpeaking(true);
+    onStart?.();
+    const phoneName = isPhoneVoice(voicePreference) ? voicePreference.slice(PHONE_VOICE_PREFIX.length) : undefined;
+    const items: { text: string; payload: Promise<AudioPayload | null> }[] = [];
+    let ended = false;
+    let wake: (() => void) | null = null;
+    let anyFailed = false;
+    const poke = () => { const w = wake; wake = null; if (w) w(); };
+
+    const runner = (async () => {
+      let i = 0;
+      try {
+        while (this.playSessionId === sessionId) {
+          if (i < items.length) {
+            const item = items[i++];
+            const payload = await item.payload;
+            if (this.playSessionId !== sessionId) break;
+            let ok = false;
+            if (payload) ok = await this.playAudio(payload, sessionId);
+            if (!ok && this.playSessionId === sessionId) ok = await this.fallbackBrowserTTS(item.text, sessionId, phoneName);
+            if (!ok) anyFailed = true;
+          } else if (ended) {
+            break;
+          } else {
+            await new Promise<void>(r => { wake = r; });
+          }
+        }
+      } catch { anyFailed = true; }
+      if (this.playSessionId === sessionId) {
+        this.setSpeaking(false);
+        onEnd?.();
+      }
+      return !anyFailed;
+    })();
+
+    return {
+      push: (text: string) => {
+        const t = (text || '').trim();
+        if (!t) return;
+        items.push({ text: t, payload: this.fetchAudioPayload(t, voicePreference) });
+        poke();
+      },
+      end: (): Promise<boolean> => { ended = true; poke(); return runner; },
+      cancel: () => { if (this.playSessionId === sessionId) this.stop(); poke(); }
+    };
+  }
+
   public async speak(
     text: string, 
     voicePreference: string = 'Puck',
@@ -395,9 +467,7 @@ class MachiVoiceManager {
     if (!text || !text.trim()) return false;
     const cleanText = text.trim();
 
-    const rawSentences = cleanText.match(/[^.!?]+[.!?]+|\S[^.!?]*$/g);
-    const sentences = rawSentences ? rawSentences.map(s => s.trim()).filter(s => s.length > 0) : [cleanText];
-
+    const sentences = takeSentences(cleanText, true, 1).sentences;
     if (sentences.length > 1) {
       return this.speakPipelined(sentences, voicePreference, onStart, onEnd);
     }
@@ -405,8 +475,9 @@ class MachiVoiceManager {
     return this.speakPipelined([cleanText], voicePreference, onStart, onEnd);
   }
 
-  private fallbackBrowserTTS(text: string, sessionId?: number): Promise<boolean> {
+  private fallbackBrowserTTS(text: string, sessionId?: number, phoneVoiceName?: string): Promise<boolean> {
     return new Promise((resolve) => {
+      if (!phoneVoiceName) this.onVoiceStatus?.("Server voice unavailable - speaking with this phone's built-in voice instead.");
       // Android APK: WebView has no speechSynthesis -> use native Android TextToSpeech
       const nb = typeof window !== 'undefined' ? (window as any).MachiAndroid : null;
       if (nb && typeof nb.speakText === 'function') {
@@ -422,7 +493,11 @@ class MachiVoiceManager {
         (window as any).onMachiNativeTtsDone = () => finish(true);
         (window as any).onMachiNativeTtsError = (why: string) => finish(false, why);
         setTimeout(() => finish(false, 'native TTS timeout'), 30000);
-        try { nb.speakText(text, 'en-IN'); } catch (e) { finish(false, String(e)); }
+        const lang = /[\u0B80-\u0BFF]/.test(text) ? 'ta-IN' : 'en-IN';
+        try {
+          if (phoneVoiceName && typeof nb.speakTextWithVoice === 'function') nb.speakTextWithVoice(text, lang, phoneVoiceName);
+          else nb.speakText(text, lang);
+        } catch (e) { finish(false, String(e)); }
         return;
       }
       if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
