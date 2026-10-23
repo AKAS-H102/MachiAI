@@ -24,7 +24,7 @@ import {
   Globe,
   Radio
 } from 'lucide-react';
-import { machiVoice, getBackendBaseUrl, isEmbeddedApp, setBackendBaseUrl } from './utils/machiVoice.ts';
+import { machiVoice, getBackendBaseUrl, isEmbeddedApp, setBackendBaseUrl, VOICE_OPTIONS, getSavedVoice, saveVoice } from './utils/machiVoice.ts';
 
 interface Message {
   id: string;
@@ -62,7 +62,7 @@ export default function App() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [volumePercent, setVolumePercent] = useState<number>(125);
-  const [selectedVoice, setSelectedVoice] = useState<string>('Puck');
+  const [selectedVoice, setSelectedVoice] = useState<string>(getSavedVoice());
   const [activeTab, setActiveTab] = useState<'chat' | 'installers' | 'reminders'>('chat');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
@@ -88,6 +88,7 @@ export default function App() {
   const isHandsFreeRef = useRef<boolean>(true);
   const lastProcessedTranscriptRef = useRef<string>('');
   const lastProcessedTimeRef = useRef<number>(0);
+  const lastAlternativesRef = useRef<string[]>([]);
 
   useEffect(() => {
     isHandsFreeRef.current = isHandsFree;
@@ -120,7 +121,13 @@ export default function App() {
     // Set up Web Speech Recognition fallback for desktop browser
     initWebSpeechRecognition(speechLanguage);
 
+    // Keep the free-tier backend awake while the app is open (it sleeps after ~15 min idle -> 50s first reply)
+    const keepWarm = setInterval(() => {
+      fetch(`${getBackendBaseUrl()}/api/machi/status`).catch(() => {});
+    }, 4 * 60 * 1000);
+
     return () => {
+      clearInterval(keepWarm);
       unsubscribe();
       machiVoice.stop();
       stopListeningAction(true);
@@ -157,7 +164,7 @@ export default function App() {
       setInterimTranscript('');
     };
 
-    (window as any).onMachiNativeFinalTranscript = (text: string, confidence?: number) => {
+    (window as any).onMachiNativeFinalTranscript = (text: string, confidence?: number, alts?: string[]) => {
       setInterimTranscript('');
       // Ignore anything captured while Machi talks or right after (its own echo)
       if (machiVoice.getSpeakingState() || machiVoice.msSinceSpeechEnd() < 800) return;
@@ -167,11 +174,14 @@ export default function App() {
       const now = Date.now();
       console.log(`[Machi Timing] stt=${now - sttReadyTsRef.current}ms conf=${confidence}`);
 
-      // Unclear speech: ask to repeat instead of guessing
-      if (clean.length < 2 || (typeof confidence === 'number' && confidence >= 0 && confidence < 0.4)) {
+      // Soft or unclear speech gets LOW recognizer confidence even when the words are right, so only ask to repeat
+      // when the result is essentially empty/garbage. Everything else is sent, together with the recognizer's
+      // other candidate transcripts so the AI can work out what was meant.
+      if (clean.length < 2 || (typeof confidence === 'number' && confidence >= 0 && confidence < 0.1)) {
         askToRepeat();
         return;
       }
+      lastAlternativesRef.current = Array.isArray(alts) ? alts.filter(a => typeof a === 'string' && a.trim() && a.trim() !== clean).slice(0, 3) : [];
 
       // Guard against duplicate / stale submissions
       if (clean !== lastProcessedTranscriptRef.current || now - lastProcessedTimeRef.current > 3000) {
@@ -224,7 +234,7 @@ export default function App() {
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = lang;
-      recognition.maxAlternatives = 1;
+      recognition.maxAlternatives = 3;
 
       recognition.onstart = () => {
         setIsListening(true);
@@ -248,9 +258,11 @@ export default function App() {
         let finalTrans = '';
         let interimTrans = '';
 
+        const webAlts: string[] = [];
         for (let i = event.resultIndex; i < event.results.length; ++i) {
           if (event.results[i].isFinal) {
             finalTrans += event.results[i][0].transcript;
+            for (let k = 1; k < event.results[i].length; k++) webAlts.push(String(event.results[i][k].transcript || '').trim());
           } else {
             interimTrans += event.results[i][0].transcript;
           }
@@ -270,6 +282,7 @@ export default function App() {
           ) {
             lastProcessedTranscriptRef.current = clean;
             lastProcessedTimeRef.current = now;
+            lastAlternativesRef.current = webAlts.filter(a => a && a !== clean).slice(0, 3);
             handleSendRef.current(clean);
           }
         }
@@ -413,20 +426,40 @@ export default function App() {
       }));
 
       const reqStart = Date.now();
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 30000);
-      let response: Response;
-      try {
-        console.log(`[Machi] POST ${baseUrl}/api/machi/chat`);
-        response = await fetch(`${baseUrl}/api/machi/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text, conversationHistory: history }),
-          signal: controller.signal
-        });
-      } finally {
-        clearTimeout(timer);
+      const alternatives = lastAlternativesRef.current;
+      lastAlternativesRef.current = [];
+      const body = JSON.stringify({ message: text, conversationHistory: history, alternatives, languagePreference: speechLanguage });
+
+      // The free Render server sleeps when idle and can need ~50s to wake up, so allow 60s, and retry once on a
+      // network error / 502 / 503 / timeout instead of immediately showing an error.
+      let response: Response | null = null;
+      let lastNetErr: any = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 45000);
+        try {
+          console.log(`[Machi] POST ${baseUrl}/api/machi/chat (attempt ${attempt})`);
+          response = await fetch(`${baseUrl}/api/machi/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+            signal: controller.signal
+          });
+          lastNetErr = null;
+          if ((response.status === 502 || response.status === 503) && attempt === 1) {
+            console.warn(`[Machi] chat HTTP ${response.status}, retrying once`);
+            continue;
+          }
+          break;
+        } catch (e: any) {
+          lastNetErr = e;
+          response = null;
+          if (attempt === 2) throw e;
+        } finally {
+          clearTimeout(timer);
+        }
       }
+      if (!response) throw lastNetErr || new Error('no response');
 
       if (!response.ok) {
         let serverMsg = '';
@@ -497,6 +530,38 @@ export default function App() {
 
   isLoadingRef.current = isLoading;
   handleSendRef.current = (t, r) => { handleSendMessage(t, r); };
+
+  const handleVoiceChange = (id: string) => {
+    setSelectedVoice(id);
+    saveVoice(id);
+    setVoiceError(null);
+    machiVoice.unlockAudio();
+    machiVoice.stop();
+    // Preview the newly chosen voice so the change is audible immediately
+    machiVoice.speak("Hey machi, idhu dhaan en new voice da.", id)
+      .then(ok => { if (!ok) setVoiceError('Could not play the sample for this voice. Check the server connection and phone volume.'); });
+  };
+
+  const voicePicker = (compact: boolean) => (
+    <div className={compact ? 'flex items-center gap-1.5 pt-0.5' : 'space-y-1.5 bg-slate-950/80 p-3 rounded-xl border border-slate-800'}>
+      <span className={compact ? 'text-[10px] text-slate-500 font-mono' : 'text-xs font-semibold text-slate-300 flex items-center gap-1.5'}>
+        {compact ? 'Voice:' : <><Volume2 className="w-3.5 h-3.5 text-cyan-400" /> Machi's Voice:</>}
+      </span>
+      <select
+        aria-label="Machi's voice"
+        value={selectedVoice}
+        onChange={(e) => handleVoiceChange(e.target.value)}
+        className={compact
+          ? 'text-[11px] font-mono px-2 py-0.5 rounded bg-slate-900 text-cyan-300 border border-cyan-800/60 max-w-[200px]'
+          : 'w-full py-2 px-2.5 rounded-lg text-xs bg-slate-900 text-cyan-300 border border-cyan-800/60'}
+      >
+        {VOICE_OPTIONS.map(v => <option key={v.id} value={v.id}>{v.label} - {v.note}</option>)}
+      </select>
+      {!compact && (
+        <p className="text-[10px] text-slate-500 leading-snug">If the chosen neural voice is busy, Machi briefly uses a backup voice so you never get silence.</p>
+      )}
+    </div>
+  );
 
   const handleTestVoice = () => {
     machiVoice.unlockAudio();
@@ -585,15 +650,13 @@ export default function App() {
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-2">
                 <CheckCircle className="w-4 h-4 text-cyan-400" />
-                <span className="text-xs font-bold text-white tracking-wide">Locked Voice</span>
+                <span className="text-xs font-bold text-white tracking-wide">Machi Voice</span>
               </div>
               <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-700/60">
-                PUCK (NEURAL)
+                {selectedVoice.toUpperCase()}
               </span>
             </div>
-            <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
-              Warm, conversational male friend persona frozen across Web, Windows, and Android.
-            </p>
+            <div className="mb-3">{voicePicker(false)}</div>
 
             {/* Volume Slider */}
             <div className="space-y-1.5 bg-slate-950/60 p-2.5 rounded-xl border border-slate-800/80 mb-3">
@@ -800,6 +863,9 @@ export default function App() {
               />
             </div>
 
+            {/* Voice Selector */}
+            {voicePicker(false)}
+
             {/* Language Selector */}
             <div className="space-y-1.5 bg-slate-950/80 p-3 rounded-xl border border-slate-800">
               <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
@@ -984,6 +1050,9 @@ export default function App() {
                     {speechLanguage === 'en-IN' ? 'Tanglish / English (IN)' : 'தமிழ் (Tamil)'}
                   </button>
                 </div>
+
+                {/* Voice selector - always visible */}
+                {voicePicker(true)}
               </div>
             </div>
 

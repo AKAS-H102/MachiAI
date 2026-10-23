@@ -3,6 +3,7 @@ import http from "http";
 import { GoogleGenAI } from "@google/genai";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import dotenv from "dotenv";
+import { hedgedRace, DeadList, errorCode } from "./lib/race.ts";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -111,32 +112,46 @@ function callWithTimeout<T>(promise: Promise<T>, timeoutMs: number, label: strin
   ]);
 }
 
-async function generateGeminiContentWithFastFallback(contents: any[], baseConfig: any) {
-  let lastError: any = null;
-  const codes: string[] = [];
+const CHAT_HEDGE_MS = parseInt(process.env.CHAT_HEDGE_MS || "5000", 10);
+// Thinking makes replies several seconds slower; chat does not need it. Set GEMINI_THINKING_BUDGET=off to disable this tweak.
+const THINKING_BUDGET = process.env.GEMINI_THINKING_BUDGET ?? "0";
+const deadModels = new DeadList();
+const noThinkingModels = new Set<string>();
 
-  for (const modelName of CANDIDATE_MODELS) {
-    try {
-      const config = { ...baseConfig };
-
-      // Per-model timeout (CHAT_TIMEOUT_MS): prevents hanging if a model experiences 503 or demand spikes
-      const response = await callWithTimeout(
-        ai.models.generateContent({ model: modelName, contents, config }),
-        CHAT_TIMEOUT_MS,
-        modelName
-      );
-
-      return { response, modelUsed: modelName };
-    } catch (err: any) {
-      lastError = err;
-      codes.push(String(err?.status || (String(err?.message || "").match(/"code":(\d+)/)?.[1]) || "timeout"));
-      const status = err?.status || (err?.message?.includes("503") ? 503 : err?.message?.includes("429") ? 429 : "timeout");
-      console.error(`[Machi] Model ${modelName} FAILED (${status}): ${String(err?.message || err).slice(0, 200)}. Trying next model.`);
+async function callModel(modelName: string, contents: any[], baseConfig: any) {
+  const useThinking = THINKING_BUDGET !== "off" && !noThinkingModels.has(modelName);
+  const config = useThinking ? { ...baseConfig, thinkingConfig: { thinkingBudget: parseInt(THINKING_BUDGET, 10) || 0 } } : baseConfig;
+  try {
+    return await ai.models.generateContent({ model: modelName, contents, config });
+  } catch (err: any) {
+    if (useThinking && errorCode(err) === "400" && /think/i.test(String(err?.message))) {
+      noThinkingModels.add(modelName); // this model rejects the thinking setting: retry once without it, remember it
+      console.warn(`[Machi] ${modelName} rejects thinkingConfig; retrying without it.`);
+      return await ai.models.generateContent({ model: modelName, contents, config: baseConfig });
     }
+    throw err;
   }
-  const e: any = new Error(String(lastError?.message || lastError));
-  e.codes = codes;
-  throw e;
+}
+
+// Starts the first model; if it is slow (CHAT_HEDGE_MS) or fails, the next model starts in parallel. First good answer wins.
+// Models that answered 404 (retired) are skipped for 30 minutes instead of costing time on every message.
+async function generateGeminiContentWithFastFallback(contents: any[], baseConfig: any) {
+  const tasks = deadModels.live(CANDIDATE_MODELS.map(name => ({ name, run: () => callModel(name, contents, baseConfig) })));
+  try {
+    const r = await hedgedRace(tasks, {
+      hedgeMs: CHAT_HEDGE_MS,
+      timeoutMs: CHAT_TIMEOUT_MS,
+      onFail: (f) => {
+        console.error(`[Machi] Model ${f.name} FAILED (${f.code}): ${f.message}`);
+        if (f.code === "404") deadModels.mark(f.name);
+      },
+    });
+    return { response: r.value, modelUsed: r.name };
+  } catch (e: any) {
+    const err: any = new Error(String(e?.message || e));
+    err.codes = (e?.failures || []).map((f: any) => f.code);
+    throw err;
+  }
 }
 
 function explainAiFailure(codes: string[] = []): string {
@@ -150,7 +165,7 @@ function explainAiFailure(codes: string[] = []): string {
 app.post("/api/machi/chat", async (req, res) => {
   const startTime = Date.now();
   try {
-    const { message, conversationHistory = [], languagePreference, context } = req.body;
+    const { message, conversationHistory = [], languagePreference, context, alternatives } = req.body;
 
     if (!message || typeof message !== "string") {
       return res.status(400).json({ error: "Message is required" });
@@ -234,7 +249,13 @@ app.post("/api/machi/chat", async (req, res) => {
     }
 
     const conversationContext = context ? `Context: ${JSON.stringify(context)}\n` : "";
-    contents.push({ role: "user", parts: [{ text: `${conversationContext}User says: "${trimmed}"` }] });
+    const alts = Array.isArray(alternatives)
+      ? alternatives.filter((x: any) => typeof x === "string" && x.trim() && x.trim().toLowerCase() !== lower).slice(0, 3).map((x: string) => x.slice(0, 300))
+      : [];
+    const altNote = alts.length
+      ? `\n(Voice input. The speech recognizer may have misheard a soft or unclear voice. Other possible transcripts: ${alts.map(a => `"${a}"`).join(" | ")}. Reply to what the user most plausibly meant.)`
+      : "";
+    contents.push({ role: "user", parts: [{ text: `${conversationContext}User says: "${trimmed}"${altNote}` }] });
 
     const needsSearch = requiresWebSearch(trimmed);
     const config: any = {
@@ -407,23 +428,24 @@ function setCachedTTS(key: string, val: any) {
 const inFlightTtsRequests = new Map<string, Promise<any>>();
 let edgeTtsCooldownUntil = 0;
 
+// Voices selectable in the app. Puck/Charon = Gemini neural; the rest = Microsoft Edge neural voices.
+const EDGE_VOICES: Record<string, string> = {
+  guy: "en-US-GuyNeural",
+  andrew: "en-US-AndrewMultilingualNeural",
+  brian: "en-US-BrianMultilingualNeural",
+  prabhat: "en-IN-PrabhatNeural",
+  valluvar: "ta-IN-ValluvarNeural",
+  pallavi: "ta-IN-PallaviNeural",
+};
+
 async function synthesizeWithEdgeTTS(text: string, preferredVoice?: string, speechRate?: number, pitchVal?: number) {
   if (Date.now() < edgeTtsCooldownUntil) {
     return null;
   }
 
   const isTamilScript = /[\u0B80-\u0BFF]/.test(text);
-  let targetVoice = "en-US-GuyNeural";
-
-  if (preferredVoice === "Guy" || preferredVoice === "guy_conversational") {
-    targetVoice = "en-US-GuyNeural";
-  } else if (preferredVoice === "Valluvar" || isTamilScript) {
-    targetVoice = "ta-IN-ValluvarNeural";
-  } else if (preferredVoice === "Andrew" || preferredVoice === "andrew_conversational") {
-    targetVoice = "en-US-AndrewMultilingualNeural";
-  } else if (preferredVoice === "Brian" || preferredVoice === "brian_conversational") {
-    targetVoice = "en-US-BrianMultilingualNeural";
-  }
+  const voiceKey = (preferredVoice || "").replace(/_conversational$/i, "").toLowerCase();
+  const targetVoice = EDGE_VOICES[voiceKey] || (isTamilScript ? "ta-IN-ValluvarNeural" : "en-US-GuyNeural");
 
   const formattedText = formatConversationalText(text);
 
@@ -506,48 +528,24 @@ function pcmToWavBase64(pcmBase64: string, sampleRate = 24000, channels = 1, bit
   return Buffer.concat([header, pcm]).toString("base64");
 }
 
-async function synthesizeWithGeminiTTS(text: string, selectedVoice: string = "Puck") {
-  if (!apiKey) return null;
-  const formattedText = formatConversationalText(text);
-  const candidateModels = (process.env.GEMINI_TTS_MODELS || "gemini-2.5-flash-preview-tts,gemini-2.5-flash-lite-preview-tts").split(",").map(m => m.trim()).filter(Boolean);
+const TTS_MODELS = (process.env.GEMINI_TTS_MODELS || "gemini-2.5-flash-preview-tts,gemini-2.5-flash-lite-preview-tts")
+  .split(",").map(m => m.trim()).filter(Boolean);
+const deadTtsModels = new DeadList();
+const TTS_HEDGE_MS = parseInt(process.env.TTS_HEDGE_MS || "3500", 10);
 
-  for (const modelName of candidateModels) {
-    try {
-      const response = await callWithTimeout(
-        ai.models.generateContent({
-          model: modelName,
-          contents: [{
-            role: "user",
-            parts: [{
-              text: formattedText
-            }]
-          }],
-          config: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: selectedVoice }
-              }
-            }
-          }
-        }),
-        8000,
-        modelName
-      );
-
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (base64Audio) {
-        return {
-          audioBase64: pcmToWavBase64(base64Audio),
-          mimeType: "audio/wav",
-          voice: selectedVoice,
-        };
-      }
-    } catch (err: any) {
-      console.error(`[Machi TTS] Gemini TTS ${modelName} FAILED: ${String(err?.message || err).slice(0, 160)}`);
-    }
-  }
-  return null;
+async function geminiTtsOnce(modelName: string, text: string, voiceName: string) {
+  if (!apiKey) throw Object.assign(new Error("no api key"), { code: "nokey" });
+  const response: any = await ai.models.generateContent({
+    model: modelName,
+    contents: [{ role: "user", parts: [{ text: formatConversationalText(text) }] }],
+    config: {
+      responseModalities: ["AUDIO"],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
+    },
+  });
+  const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  if (!base64Audio) throw new Error("Gemini TTS returned no audio");
+  return { audioBase64: pcmToWavBase64(base64Audio), mimeType: "audio/wav", voice: voiceName, usedFallback: false };
 }
 
 async function executeSpeechSynthesis(text: string, preferredVoice?: string, rate?: number, pitch?: number) {
@@ -555,43 +553,47 @@ async function executeSpeechSynthesis(text: string, preferredVoice?: string, rat
   const cacheKey = `${preferredVoice || "Puck"}|${rate || 1}|${pitch || 1}|${cleanText}`;
 
   const cached = getCachedTTS(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  if (inFlightTtsRequests.has(cacheKey)) {
-    return await inFlightTtsRequests.get(cacheKey);
-  }
+  if (cached) return cached;
+  if (inFlightTtsRequests.has(cacheKey)) return await inFlightTtsRequests.get(cacheKey);
 
   const synthesisPromise = (async () => {
-    const wantsEdgeVoice = preferredVoice === "Guy" || preferredVoice === "Andrew" || preferredVoice === "Brian" || preferredVoice === "Valluvar";
+    const key = (preferredVoice || "Puck").replace(/_conversational$/i, "").replace(/^gemini_/i, "").toLowerCase();
+    const wantsEdge = !!EDGE_VOICES[key];
+    const gemVoice = key === "charon" ? "Charon" : "Puck";
 
-    if (wantsEdgeVoice && Date.now() >= edgeTtsCooldownUntil) {
-      const edgeResult = await synthesizeWithEdgeTTS(cleanText, preferredVoice, rate, pitch);
-      if (edgeResult) {
-        setCachedTTS(cacheKey, edgeResult);
-        return edgeResult;
-      }
+    const edgeTask = (voice: string, fallback: boolean) => ({
+      name: `edge:${voice}`,
+      run: async () => {
+        const r = await synthesizeWithEdgeTTS(cleanText, voice, rate, pitch);
+        if (!r) throw Object.assign(new Error("Edge TTS unavailable"), { code: "edge" });
+        return { ...r, usedFallback: fallback };
+      },
+    });
+    const geminiTasks = TTS_MODELS.filter(m => !deadTtsModels.isDead(m)).map(m => ({
+      name: m, run: () => geminiTtsOnce(m, cleanText, gemVoice),
+    }));
+
+    // Chosen voice first. If it is slow (3.5s) or fails, the next engine starts in parallel so speech is never left silent.
+    const tasks = wantsEdge
+      ? [edgeTask(preferredVoice || "Guy", false), ...geminiTasks]
+      : [...geminiTasks, edgeTask("en-US-GuyNeural", true)];
+
+    try {
+      const r = await hedgedRace<any>(tasks, {
+        hedgeMs: TTS_HEDGE_MS,
+        timeoutMs: 12000,
+        onFail: (f) => {
+          console.warn(`[Machi TTS] ${f.name} FAILED (${f.code}): ${f.message.slice(0, 140)}`);
+          if (f.code === "404" && !f.name.startsWith("edge:")) deadTtsModels.mark(f.name);
+        },
+      });
+      const result = r.value;
+      if (!result.usedFallback) setCachedTTS(cacheKey, result); // never cache a fallback voice
+      return result;
+    } catch (e: any) {
+      console.error("[Machi TTS] all engines failed:", (e?.failures || []).map((f: any) => `${f.name}:${f.code}`).join(", "));
+      return null;
     }
-
-    // Default primary: Puck neural voice
-    const geminiVoice = preferredVoice === "Charon" || preferredVoice === "gemini_charon" ? "Charon" : "Puck";
-    const geminiResult = await synthesizeWithGeminiTTS(cleanText, geminiVoice);
-    if (geminiResult) {
-      setCachedTTS(cacheKey, geminiResult);
-      return geminiResult;
-    }
-
-    // High-speed fallback to Guy Neural if Gemini is busy
-    if (Date.now() >= edgeTtsCooldownUntil) {
-      const edgeFallback = await synthesizeWithEdgeTTS(cleanText, "en-US-GuyNeural", rate, pitch);
-      if (edgeFallback) {
-        setCachedTTS(cacheKey, edgeFallback);
-        return edgeFallback;
-      }
-    }
-
-    return null;
   })();
 
   inFlightTtsRequests.set(cacheKey, synthesisPromise);
@@ -614,7 +616,7 @@ app.post("/api/machi/tts", async (req, res) => {
     }
 
     const result = await executeSpeechSynthesis(trimmed, voice, rate, pitch);
-    console.log(`[Machi TTS] voice=${voice || "default"} chars=${trimmed.length} ok=${!!result}`);
+    console.log(`[Machi TTS] requested=${voice || "default"} used=${result?.voice || "none"} fallback=${!!result?.usedFallback} chars=${trimmed.length}`);
     if (result) {
       return res.json(result);
     }

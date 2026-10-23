@@ -14,6 +14,44 @@ export interface AudioPayload {
   url: string;
 }
 
+export interface VoiceOption { id: string; label: string; note: string; }
+export const VOICE_OPTIONS: VoiceOption[] = [
+  { id: 'Puck', label: 'Puck', note: 'Default neural voice (Gemini)' },
+  { id: 'Charon', label: 'Charon', note: 'Deeper neural voice (Gemini)' },
+  { id: 'Prabhat', label: 'Prabhat', note: 'Indian English, male' },
+  { id: 'Guy', label: 'Guy', note: 'US English, male' },
+  { id: 'Andrew', label: 'Andrew', note: 'US English, male' },
+  { id: 'Brian', label: 'Brian', note: 'US English, male' },
+  { id: 'Valluvar', label: 'Valluvar', note: 'Tamil, male' },
+  { id: 'Pallavi', label: 'Pallavi', note: 'Tamil, female' },
+];
+
+// First chunk <= ~140 chars (fast start), later chunks <= ~260 chars. A single long sentence stays whole.
+export function chunkSentences(sentences: string[], firstMax: number = 140, restMax: number = 260): string[] {
+  const out: string[] = [];
+  for (const raw of sentences) {
+    const sent = raw.trim();
+    if (!sent) continue;
+    const last = out[out.length - 1];
+    const max = out.length === 1 ? firstMax : restMax; // out.length === 1 means chunk #1 is still being built
+    if (last !== undefined && (last + ' ' + sent).length <= max) out[out.length - 1] = last + ' ' + sent;
+    else out.push(sent);
+  }
+  return out;
+}
+
+export function getSavedVoice(): string {
+  try {
+    const v = localStorage.getItem('machi_voice') || '';
+    if (VOICE_OPTIONS.some(o => o.id === v)) return v;
+  } catch {}
+  return 'Puck';
+}
+
+export function saveVoice(id: string) {
+  try { localStorage.setItem('machi_voice', id); } catch {}
+}
+
 // Backend URL resolution order:
 //  1. URL saved by the user in-app (localStorage "machi_backend_url")
 //  2. window.__MACHI_BACKEND_URL__ (injected by host page)
@@ -61,6 +99,8 @@ class MachiVoiceManager {
   private playSessionId: number = 0;
   private audioUnlocked: boolean = false;
   private lastSpeechEndTs: number = 0;
+  public lastVoiceUsed: string = '';
+  public lastWasFallback: boolean = false;
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -164,50 +204,41 @@ class MachiVoiceManager {
     const cached = this.audioPayloadCache.get(cacheKey);
     if (cached) return cached;
 
-    try {
-      const baseUrl = getBackendBaseUrl();
-      const t0 = Date.now();
-      const res = await fetch(`${baseUrl}/api/machi/tts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: cleanText,
-          voice: voicePreference,
-          rate: 1.0,
-          pitch: 1.0
-        })
-      });
-
-      if (!res.ok) {
-        console.warn(`[Machi Voice] TTS HTTP ${res.status} from ${baseUrl || '(no backend)'}`);
-      }
-      if (res.ok) {
-        const data: TTSResponse = await res.json();
-        if (data.audioBase64) {
-          const byteChars = atob(data.audioBase64);
-          const byteNumbers = new Array(byteChars.length);
-          for (let i = 0; i < byteChars.length; i++) {
-            byteNumbers[i] = byteChars.charCodeAt(i);
-          }
-          const byteArray = new Uint8Array(byteNumbers);
-          const mime = data.mimeType || (data.audioBase64.startsWith('UklGR') ? 'audio/wav' : 'audio/mpeg');
-          console.log(`[Machi Timing] tts_fetch=${Date.now() - t0}ms`);
-          console.log(`[Machi Voice] TTS ok voice=${data.voice} mime=${mime} bytes~${Math.round(data.audioBase64.length * 0.75)}`);
-          const blob = new Blob([byteArray], { type: mime });
-          const url = URL.createObjectURL(blob);
-
-          const payload: AudioPayload = {
-            base64: data.audioBase64,
-            mimeType: mime,
-            url
-          };
-
-          this.audioPayloadCache.set(cacheKey, payload);
-          return payload;
+    const baseUrl = getBackendBaseUrl();
+    const t0 = Date.now();
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20000);
+      try {
+        const res = await fetch(`${baseUrl}/api/machi/tts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: cleanText, voice: voicePreference, rate: 1.0, pitch: 1.0 }),
+          signal: controller.signal
+        });
+        if (!res.ok) {
+          console.warn(`[Machi Voice] TTS HTTP ${res.status} from ${baseUrl || '(no backend)'} (attempt ${attempt})`);
+          if (res.status >= 400 && res.status < 500 && res.status !== 429) break; // not retryable
+          continue;
         }
+        const data: TTSResponse & { usedFallback?: boolean } = await res.json();
+        if (!data.audioBase64) { console.warn('[Machi Voice] TTS reply had no audio'); continue; }
+        const byteChars = atob(data.audioBase64);
+        const byteArray = new Uint8Array(byteChars.length);
+        for (let i = 0; i < byteChars.length; i++) byteArray[i] = byteChars.charCodeAt(i);
+        const mime = data.mimeType || (data.audioBase64.startsWith('UklGR') ? 'audio/wav' : 'audio/mpeg');
+        console.log(`[Machi Timing] tts_fetch=${Date.now() - t0}ms`);
+        console.log(`[Machi Voice] TTS ok requested=${voicePreference} used=${data.voice} fallback=${!!data.usedFallback} mime=${mime} bytes~${Math.round(data.audioBase64.length * 0.75)}`);
+        this.lastVoiceUsed = data.voice;
+        this.lastWasFallback = !!data.usedFallback;
+        const payload: AudioPayload = { base64: data.audioBase64, mimeType: mime, url: URL.createObjectURL(new Blob([byteArray], { type: mime })) };
+        this.audioPayloadCache.set(cacheKey, payload);
+        return payload;
+      } catch (e) {
+        console.warn(`[Machi Voice] TTS fetch problem (attempt ${attempt}):`, String(e));
+      } finally {
+        clearTimeout(timer);
       }
-    } catch (e) {
-      console.warn('[Machi Voice] Audio prefetch note:', e);
     }
     return null;
   }
@@ -300,6 +331,11 @@ class MachiVoiceManager {
     if (!sentences || sentences.length === 0) return false;
     const cleanSentences = sentences.map(s => s.trim()).filter(s => s.length > 0);
     if (cleanSentences.length === 0) return false;
+
+    // Few, larger requests = fewer gaps and fewer chances to fail; short first chunk so speech starts quickly.
+    const chunks = chunkSentences(cleanSentences);
+    cleanSentences.length = 0;
+    cleanSentences.push(...chunks);
 
     this.stop();
     const sessionId = ++this.playSessionId;

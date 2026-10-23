@@ -333,7 +333,16 @@ public class MainActivity extends Activity {
                         float[] sc = results.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES);
                         float conf = (sc != null && sc.length > 0) ? sc[0] : -1f;
                         Log.d(TAG, "STT final result received (" + m.get(0).length() + " chars) conf=" + conf);
-                        evalJs("window.onMachiNativeFinalTranscript && window.onMachiNativeFinalTranscript(" + jsStr(m.get(0)) + "," + conf + ");");
+                        // Send the other candidate transcripts too: soft / unclear speech is often mis-ranked,
+                        // and the AI can use the alternatives to work out what was really said.
+                        StringBuilder alts = new StringBuilder("[");
+                        for (int i = 1; i < m.size() && i < 5; i++) {
+                            if (m.get(i) == null || m.get(i).trim().length() == 0) continue;
+                            if (alts.length() > 1) alts.append(",");
+                            alts.append(jsStr(m.get(i)));
+                        }
+                        alts.append("]");
+                        evalJs("window.onMachiNativeFinalTranscript && window.onMachiNativeFinalTranscript(" + jsStr(m.get(0)) + "," + conf + "," + alts + ");");
                     } else {
                         evalJs("window.onMachiNativeSpeechError && window.onMachiNativeSpeechError('no_match');");
                     }
@@ -352,11 +361,15 @@ public class MainActivity extends Activity {
             String lang = (language != null && !language.isEmpty()) ? language : "en-IN";
             intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang);
             intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-            intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+            intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
             intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
             // Longer silence windows so quiet / slow speakers are not cut off
-            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L);
-            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L);
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2800L);
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2400L);
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L);
+            // Prefer the chosen language but also understand Tamil / Indian & US English words mixed in (Tanglish)
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang);
+            intent.putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", new String[]{"ta-IN", "en-IN", "en-US"});
             Log.d(TAG, "STT start lang=" + lang);
             mSpeechRecognizer.startListening(intent);
         } catch (Exception e) {
@@ -554,7 +567,9 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         if (mMediaPlayer != null) {
-            try { mMediaPlayer.pause(); } catch (Exception ignored) {}
+            releasePlayer();
+            abandonAudioFocus();
+            evalJs("window.onMachiNativeAudioEnded && window.onMachiNativeAudioEnded();");
         }
         if (mSpeechRecognizer != null) {
             try { mSpeechRecognizer.stopListening(); } catch (Exception ignored) {}
