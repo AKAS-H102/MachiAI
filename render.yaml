@@ -10,3 +10,7 @@ services:
     envVars:
       - key: GEMINI_API_KEY
         sync: false        # you paste the key in Render's dashboard; it is never stored in this repo
+      - key: GEMINI_MODELS
+        value: gemini-3.8-flash,gemini-flash-latest,gemini-3.5-flash-lite
+      - key: CHAT_TIMEOUT_MS
+        value: "15000"

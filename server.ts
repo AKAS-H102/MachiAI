@@ -75,9 +75,9 @@ Always respond in valid JSON format:
 }
 `;
 
-const CANDIDATE_MODELS = (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-2.5-flash,gemini-2.5-flash-lite")
+const CANDIDATE_MODELS = (process.env.GEMINI_MODELS || "gemini-3.8-flash,gemini-flash-latest,gemini-3.5-flash-lite")
   .split(",").map(m => m.trim()).filter(Boolean);
-const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || "12000", 10);
+const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || "15000", 10);
 
 function requiresWebSearch(text: string): boolean {
   const lower = text.toLowerCase();
@@ -112,7 +112,8 @@ function callWithTimeout<T>(promise: Promise<T>, timeoutMs: number, label: strin
 }
 
 async function generateGeminiContentWithFastFallback(contents: any[], baseConfig: any) {
-  let lastError = null;
+  let lastError: any = null;
+  const codes: string[] = [];
 
   for (const modelName of CANDIDATE_MODELS) {
     try {
@@ -128,11 +129,22 @@ async function generateGeminiContentWithFastFallback(contents: any[], baseConfig
       return { response, modelUsed: modelName };
     } catch (err: any) {
       lastError = err;
+      codes.push(String(err?.status || (String(err?.message || "").match(/"code":(\d+)/)?.[1]) || "timeout"));
       const status = err?.status || (err?.message?.includes("503") ? 503 : err?.message?.includes("429") ? 429 : "timeout");
       console.error(`[Machi] Model ${modelName} FAILED (${status}): ${String(err?.message || err).slice(0, 200)}. Trying next model.`);
     }
   }
-  throw lastError;
+  const e: any = new Error(String(lastError?.message || lastError));
+  e.codes = codes;
+  throw e;
+}
+
+function explainAiFailure(codes: string[] = []): string {
+  if (codes.length && codes.every(c => c === "404")) return "None of the configured AI models are available to this API key (404). Set GEMINI_MODELS on the server to models your key can use.";
+  if (codes.some(c => c === "401" || c === "403" || c === "400")) return "Google rejected the API key or request (" + codes.join(",") + "). Check GEMINI_API_KEY on the server.";
+  if (codes.some(c => c === "429")) return "AI quota or rate limit reached (429). Wait a minute and retry.";
+  if (codes.some(c => c === "503" || c === "timeout")) return "The AI model is busy or timed out (" + codes.join(",") + "). Please retry.";
+  return "The AI service is temporarily unavailable. Please retry.";
 }
 
 app.post("/api/machi/chat", async (req, res) => {
@@ -246,7 +258,7 @@ app.post("/api/machi/chat", async (req, res) => {
       modelUsed = result.modelUsed;
     } catch (apiErr: any) {
       console.error("[Machi] All AI models failed:", String(apiErr?.message || apiErr).slice(0, 200));
-      return res.status(502).json({ error: "The AI service is temporarily unavailable. Please retry." });
+      return res.status(502).json({ error: explainAiFailure(apiErr?.codes) });
     }
 
     const textOutput = response.text || "";
