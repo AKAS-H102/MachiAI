@@ -1,0 +1,43 @@
+name: Build Android APK
+on:
+  workflow_dispatch:
+    inputs:
+      backend_url:
+        description: "Deployed Machi backend (https://...)"
+        required: true
+        default: "https://machi-backend-meq9.onrender.com"
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Locate Android SDK tools
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          BT="$SDK/build-tools/$(ls "$SDK/build-tools" | sort -V | tail -1)"
+          PL="$(ls -d "$SDK"/platforms/android-* | sort -V | tail -1)"
+          echo "$BT" >> "$GITHUB_PATH"
+          echo "ANDROID_JAR=$PL/android.jar" >> "$GITHUB_ENV"
+          echo "build-tools: $BT"; echo "platform: $PL"
+      - name: Build APK
+        env:
+          BACKEND_URL: ${{ inputs.backend_url }}
+        run: |
+          sed -i 's/\r$//' build-android.sh
+          mkdir -p release
+          bash build-android.sh
+      - name: Verify APK
+        run: |
+          apksigner verify --verbose release/Machi.apk
+          aapt2 dump badging release/Machi.apk | grep -E "^package|uses-permission|sdkVersion"
+          unzip -l release/Machi.apk | grep -E "classes.dex|assets/www/index.html|backend_url.txt"
+          unzip -p release/Machi.apk assets/backend_url.txt; echo
+          ls -l release/Machi.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Machi-apk
+          path: release/Machi.apk

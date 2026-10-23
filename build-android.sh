@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# UNTESTED helper (written in a sandbox without the Android SDK). Needs: Node 20+, JDK 17+,
+# Needs: Node 20+, JDK 17+,
 # Android SDK build-tools (aapt2, d8, zipalign, apksigner) on PATH, ANDROID_JAR pointing at android.jar.
 # Usage: BACKEND_URL=https://your-server.example.com ./build-android.sh
 set -euo pipefail
@@ -8,10 +8,12 @@ set -euo pipefail
 npm install
 VITE_BACKEND_URL="$BACKEND_URL" npm run build          # -> dist/
 S=staging-android
-rm -rf $S/assets/www && mkdir -p $S/assets/www && cp -r dist/* $S/assets/www/
+# The WebView loads the page via loadDataWithBaseURL("https://machi.ai/"), so it must be ONE self-contained html file
+node scripts/inline-html.mjs dist dist/index.single.html
+rm -rf $S/assets/www && mkdir -p $S/assets/www && cp dist/index.single.html $S/assets/www/index.html
 printf '%s' "$BACKEND_URL" > $S/assets/backend_url.txt
 rm -rf $S/bin && mkdir -p $S/bin/classes
-javac -source 8 -target 8 -cp "$ANDROID_JAR" -d $S/bin/classes $S/src/ai/machi/assistant/MainActivity.java
+javac -Xlint:-options -source 8 -target 8 -cp "$ANDROID_JAR" -d $S/bin/classes $S/src/ai/machi/assistant/MainActivity.java
 d8 --min-api 21 --lib "$ANDROID_JAR" --output $S/bin $(find $S/bin/classes -name '*.class')
 aapt2 compile --dir $S/res -o $S/bin/res.zip
 aapt2 link -o $S/bin/unaligned.apk -I "$ANDROID_JAR" --manifest $S/AndroidManifest.xml -A $S/assets $S/bin/res.zip
