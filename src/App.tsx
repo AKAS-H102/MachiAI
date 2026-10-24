@@ -1,32 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Mic, 
-  MicOff, 
-  Volume2, 
-  Send, 
-  Sparkles, 
-  Bell, 
-  Clock, 
-  CheckCircle, 
-  Download, 
-  Info,
-  ExternalLink,
-  Laptop,
-  Smartphone,
-  RefreshCw,
-  Zap,
-  Sliders,
-  X,
-  Copy,
-  Check,
-  Link,
-  Loader2,
-  Globe,
-  Radio
-} from 'lucide-react';
+import { Mic, MicOff, Volume2, Send, Sparkles, Bell, Clock, CheckCircle, Download, Info, ExternalLink, Laptop, Smartphone, RefreshCw, Zap, Sliders, X, Copy, Check, Link, Loader2, Globe, Radio, PhoneCall } from 'lucide-react';
 import { machiVoice, getBackendBaseUrl, isEmbeddedApp, setBackendBaseUrl, VOICE_OPTIONS, getSavedVoice, saveVoice, parsePhoneVoices, isPhoneVoice } from './utils/machiVoice.ts';
 import type { VoiceOption } from './utils/machiVoice.ts';
 import { parseSse } from '../lib/stream-utils.ts';
+import { isYes, isNo } from '../lib/actions.ts';
 
 interface Message {
   id: string;
@@ -45,16 +22,39 @@ interface Reminder {
   id: string;
   title: string;
   time: string;
+  whenMs?: number;
 }
 
+const WELCOME_TEXT = "Vanakkam da machi! Machi Voice Assistant is live. Hands-free continuous conversation mode ready-ah irukku. Enna venum nu sollu da!";
+const nowStampStr = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+// Chat history, long-term memory and reminders live on the phone so they survive closing the app.
+function loadSavedMessages(): Message[] | null {
+  try {
+    const raw = localStorage.getItem('machi_messages_v1');
+    if (!raw) return null;
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return null;
+    const ok = arr.filter((m: any) => m && typeof m.id === 'string' && typeof m.text === 'string' && (m.sender === 'user' || m.sender === 'machi') && !m.isError).slice(-200);
+    return ok.length ? ok : null;
+  } catch { return null; }
+}
+function loadSavedReminders(): Reminder[] {
+  try {
+    const arr = JSON.parse(localStorage.getItem('machi_reminders_v1') || '[]');
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((r: any) => r && typeof r.id === 'string' && typeof r.title === 'string' && typeof r.whenMs === 'number' && r.whenMs > Date.now() - 10 * 60000);
+  } catch { return []; }
+}
+function loadSavedMemory(): string {
+  try { return localStorage.getItem('machi_memory_v1') || ''; } catch { return ''; }
+}
+
+interface PendingCall { name: string; number?: string; candidates?: { name: string; number: string }[]; }
+
 export default function App() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: '1',
-      sender: 'machi',
-      text: "Vanakkam da machi! Machi Voice Assistant is live. Hands-free continuous conversation mode ready-ah irukku. Enna venum nu sollu da!",
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    }
+  const [messages, setMessages] = useState<Message[]>(() => loadSavedMessages() || [
+    { id: '1', sender: 'machi', text: WELCOME_TEXT, timestamp: nowStampStr() }
   ]);
   const [inputText, setInputText] = useState('');
   const [isListening, setIsListening] = useState(false);
@@ -77,9 +77,22 @@ export default function App() {
   const [backendDraft, setBackendDraft] = useState<string>('');
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
 
-  const [reminders, setReminders] = useState<Reminder[]>([
-    { id: '1', title: 'Check project deployment', time: 'Today at 6:00 PM' }
-  ]);
+  const [reminders, setReminders] = useState<Reminder[]>(() => loadSavedReminders());
+  const [pendingCall, setPendingCall] = useState<PendingCall | null>(null);
+  const [memoryNotes, setMemoryNotes] = useState<string>(() => loadSavedMemory());
+  const [confirmForget, setConfirmForget] = useState(false);
+  const messagesRef = useRef<Message[]>([]);
+  const remindersRef = useRef<Reminder[]>([]);
+  const memoryRef = useRef<string>(loadSavedMemory());
+  const memoryTurnsRef = useRef<number>(0);
+  const memoryBusyRef = useRef<boolean>(false);
+  const pendingCallRef = useRef<PendingCall | null>(null);
+  const captureFailedRef = useRef<boolean>(false);
+  const handleVoiceRef = useRef<(b64: string, mime: string) => void>(() => {});
+  const captureErrRef = useRef<(code: string) => void>(() => {});
+  const callResultRef = useRef<(status: string, detail: string) => void>(() => {});
+  const noticeRef = useRef<(text: string, speak?: boolean) => void>(() => {});
+  const updateMemoryRef = useRef<() => void>(() => {});
 
   const [status, setStatus] = useState({
     online: true,
@@ -88,6 +101,8 @@ export default function App() {
 
   const sttReadyTsRef = useRef<number>(Date.now());
   const isLoadingRef = useRef<boolean>(false);
+  messagesRef.current = messages;
+  remindersRef.current = reminders;
   selectedVoiceRef.current = selectedVoice; // callbacks registered once (native mic, hands-free) must always see the CURRENT voice
   const handleSendRef = useRef<(t?: string, retry?: boolean) => void>(() => {});
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -159,6 +174,19 @@ export default function App() {
     (window as any).onMachiNativeRoute = (label: string) => setMicRoute(label || '');
     machiVoice.onVoiceStatus = (msg) => setVoiceError(msg);
     try { (window as any).MachiAndroid?.requestVoices?.(); } catch {}
+
+    // Own microphone capture (soft voices, Bluetooth / wired mics): the recording is transcribed on the server
+    (window as any).onMachiCaptureStart = () => { setIsListening(true); setInterimTranscript(''); };
+    (window as any).onMachiCaptureSpeech = () => setInterimTranscript('…');
+    (window as any).onMachiAudioReady = () => {
+      setIsListening(false);
+      setInterimTranscript('');
+      let b64 = '';
+      try { b64 = (window as any).MachiAndroid.takeCapturedAudio(); } catch {}
+      if (b64 && !machiVoice.getSpeakingState()) handleVoiceRef.current(b64, 'audio/wav');
+    };
+    (window as any).onMachiCaptureError = (code: string) => captureErrRef.current(code);
+    (window as any).onMachiNativeCall = (status: string, detail: string) => callResultRef.current(status, detail);
 
     (window as any).onMachiNativeSpeechStart = () => {
       setIsListening(true);
@@ -328,6 +356,15 @@ export default function App() {
 
     // Check for Native Android Speech Recognizer Bridge
     const nativeBridge = (window as any).MachiAndroid;
+    if (nativeBridge && typeof nativeBridge.startCapture === 'function' && !captureFailedRef.current) {
+      try {
+        nativeBridge.startCapture(speechLanguage);
+        return;
+      } catch (err) {
+        console.warn('[Native startCapture failed, using Android speech recognition]:', err);
+        captureFailedRef.current = true;
+      }
+    }
     if (nativeBridge && typeof nativeBridge.startListening === 'function') {
       try {
         nativeBridge.startListening(speechLanguage);
@@ -385,6 +422,35 @@ export default function App() {
   };
 
   useEffect(() => {
+    try { localStorage.setItem('machi_messages_v1', JSON.stringify(messages.filter(m => !m.isError).slice(-200))); } catch {}
+  }, [messages]);
+
+  useEffect(() => {
+    try { localStorage.setItem('machi_reminders_v1', JSON.stringify(reminders.filter(r => typeof r.whenMs === 'number'))); } catch {}
+  }, [reminders]);
+
+  // App open: make sure every pending reminder has its phone alarm, and announce the ones that come due
+  useEffect(() => {
+    const nb = (window as any).MachiAndroid;
+    if (nb && typeof nb.scheduleReminder === 'function') {
+      for (const r of remindersRef.current) {
+        if (typeof r.whenMs === 'number' && r.whenMs > Date.now()) { try { nb.scheduleReminder(r.id, r.title, String(r.whenMs)); } catch {} }
+      }
+    }
+    const iv = setInterval(() => {
+      const now = Date.now();
+      const due = remindersRef.current.filter(r => typeof r.whenMs === 'number' && (r.whenMs as number) <= now);
+      if (!due.length) return;
+      setReminders(prev => prev.filter(r => !(typeof r.whenMs === 'number' && r.whenMs <= now)));
+      for (const r of due) {
+        try { if (!(window as any).MachiAndroid && 'Notification' in window && Notification.permission === 'granted') new Notification('Machi reminder', { body: r.title }); } catch {}
+        noticeRef.current(`Reminder da machi: ${r.title}`, true);
+      }
+    }, 5000);
+    return () => clearInterval(iv);
+  }, []);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isLoading, interimTranscript]);
 
@@ -392,6 +458,303 @@ export default function App() {
     setVolumePercent(newPercent);
     machiVoice.setVolume(newPercent / 100);
   };
+
+  // =================== reminders, calls, memory, streaming ===================
+  const setPendingCallBoth = (v: PendingCall | null) => { pendingCallRef.current = v; setPendingCall(v); };
+
+  // Machi says something short about an action (not an AI answer): shown in the chat and spoken
+  const addMachiNotice = (text: string, speak: boolean = true) => {
+    setMessages(prev => [...prev, { id: 'n' + Date.now() + Math.random().toString(36).slice(2, 6), sender: 'machi', text, timestamp: nowStampStr() }]);
+    if (speak && !machiVoice.getSpeakingState()) {
+      machiVoice.speak(text, selectedVoiceRef.current, undefined, () => {
+        if (isHandsFreeRef.current) setTimeout(() => startListeningAction(), 400);
+      });
+    }
+  };
+  noticeRef.current = addMachiNotice;
+
+  const scheduleNative = (rem: Reminder) => {
+    const nb = (window as any).MachiAndroid;
+    if (nb && typeof nb.scheduleReminder === 'function') {
+      try {
+        const r = nb.scheduleReminder(rem.id, rem.title, String(rem.whenMs));
+        if (r === 'notifications_disabled') {
+          addMachiNotice("Reminder saved, but Android is blocking Machi's notifications, so I can't alert you. I'm opening the settings - please allow notifications for Machi.");
+          setTimeout(() => { try { nb.openNotificationSettings(); } catch {} }, 5000);
+        } else if (r !== 'ok') {
+          addMachiNotice("I couldn't schedule that reminder on this phone. Please try again.");
+        }
+      } catch { addMachiNotice("I couldn't schedule that reminder on this phone. Please try again."); }
+      return;
+    }
+    // Browser / desktop: alerts work only while this page stays open
+    try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch {}
+  };
+
+  const addReminder = (title: string, whenMs: number, label: string) => {
+    const rem: Reminder = { id: 'r' + whenMs + Math.random().toString(36).slice(2, 6), title, time: label || new Date(whenMs).toLocaleString(), whenMs };
+    setReminders(prev => [...prev, rem]);
+    scheduleNative(rem);
+  };
+
+  const removeReminder = (id: string) => {
+    try { (window as any).MachiAndroid?.cancelReminder?.(id); } catch {}
+    setReminders(prev => prev.filter(r => r.id !== id));
+  };
+
+  const confirmPendingCall = (cand?: { name: string; number: string }) => {
+    const pc = pendingCallRef.current;
+    if (!pc) return;
+    const nb = (window as any).MachiAndroid;
+    const name = cand ? cand.name : pc.name;
+    const number = cand ? cand.number : (pc.number || '');
+    if (nb && typeof nb.callContact === 'function') {
+      try { nb.callContact(name, number); }
+      catch { setPendingCallBoth(null); addMachiNotice("I couldn't start the call on this phone."); }
+    } else if (number) {
+      setPendingCallBoth(null);
+      window.location.href = 'tel:' + number;
+    } else {
+      setPendingCallBoth(null);
+      addMachiNotice("Calling a contact by name works in the Android app. Tell me the phone number and I can dial it.");
+    }
+  };
+  const cancelPendingCall = () => { setPendingCallBoth(null); addMachiNotice("Seri da, call cancel panniten."); };
+
+  const handleCallResult = (status: string, detail: string) => {
+    if (status === 'calling') {
+      setPendingCallBoth(null);
+      addMachiNotice(`Calling ${detail} now.`, false);
+    } else if (status === 'dialer') {
+      setPendingCallBoth(null);
+      addMachiNotice(`Opening the dialer for ${detail} - press the green call button.`, false);
+    } else if (status === 'multiple') {
+      try {
+        const list = JSON.parse(detail);
+        setPendingCallBoth({ name: pendingCallRef.current?.name || '', candidates: list });
+        addMachiNotice('I found a few contacts with that name. Tap the one you want to call.');
+      } catch { setPendingCallBoth(null); }
+    } else if (status === 'not_found') {
+      setPendingCallBoth(null);
+      addMachiNotice(`I couldn't find "${detail}" in your contacts. Tell me their phone number and I'll dial it.`);
+    } else if (status === 'no_permission') {
+      setPendingCallBoth(null);
+      addMachiNotice('I need permission to read your contacts and make calls. Allow it when Android asks, then ask me again.');
+    } else {
+      setPendingCallBoth(null);
+      addMachiNotice("The call didn't start. Please try again.");
+    }
+  };
+  callResultRef.current = handleCallResult;
+
+  const applyAction = (evt: any) => {
+    if (!evt) return;
+    if (evt.intent === 'create_reminder' && evt.actionData?.reminderTitle) {
+      const wm = Number(evt.actionData.whenMs);
+      if (isFinite(wm) && wm > Date.now()) addReminder(String(evt.actionData.reminderTitle), wm, String(evt.actionData.reminderTime || ''));
+    } else if (evt.intent === 'call_contact') {
+      const name = String(evt.actionData?.name || '');
+      const number = String(evt.actionData?.number || '');
+      if (name || number) setPendingCallBoth({ name: name || number, number: number || undefined });
+    }
+  };
+
+  // ---- long-term memory: every few exchanges the server rewrites short notes about you; they are sent with each request ----
+  const updateMemory = async () => {
+    if (memoryBusyRef.current) return;
+    memoryBusyRef.current = true;
+    try {
+      const msgs = messagesRef.current.filter(m => !m.isError).slice(-14).map(m => ({ role: m.sender === 'user' ? 'user' : 'machi', text: m.text }));
+      const res = await fetch(`${getBackendBaseUrl()}/api/machi/memory`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ memory: memoryRef.current, messages: msgs })
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (typeof d.memory === 'string') {
+          memoryRef.current = d.memory;
+          setMemoryNotes(d.memory);
+          try { localStorage.setItem('machi_memory_v1', d.memory); } catch {}
+        }
+      }
+    } catch {} finally { memoryBusyRef.current = false; }
+  };
+  updateMemoryRef.current = updateMemory;
+  const noteExchangeDone = () => {
+    memoryTurnsRef.current += 1;
+    if (memoryTurnsRef.current >= 4) { memoryTurnsRef.current = 0; setTimeout(() => updateMemoryRef.current(), 1500); }
+  };
+
+  const clearMemoryAndChat = () => {
+    if (!confirmForget) { setConfirmForget(true); setTimeout(() => setConfirmForget(false), 4000); return; }
+    setConfirmForget(false);
+    memoryRef.current = ''; memoryTurnsRef.current = 0;
+    setMemoryNotes('');
+    try { localStorage.removeItem('machi_memory_v1'); localStorage.removeItem('machi_messages_v1'); } catch {}
+    setMessages([{ id: '1', sender: 'machi', text: WELCOME_TEXT, timestamp: nowStampStr() }]);
+  };
+
+  // What the server needs for every request: recent chat, long-term notes, the current time and time zone
+  const buildPayload = (extra: Record<string, any>) => {
+    const history = messagesRef.current.filter(m => !m.isError).slice(-20).map(m => ({
+      user: m.sender === 'user' ? m.text : undefined,
+      machi: m.sender === 'machi' ? m.text : undefined,
+    }));
+    return {
+      conversationHistory: history,
+      memory: memoryRef.current,
+      nowMs: Date.now(),
+      tzOffsetMin: -new Date().getTimezoneOffset(),
+      languagePreference: speechLanguage,
+      ...extra
+    };
+  };
+
+  const finishHandsFree = () => {
+    if (isHandsFreeRef.current) {
+      setTimeout(() => {
+        if (isHandsFreeRef.current && !machiVoice.getSpeakingState()) startListeningAction();
+      }, 400);
+    }
+  };
+
+  // Streams a reply (typed text or recorded voice). Machi starts SPEAKING after the first sentence.
+  type StreamOutcome = 'done' | 'fallback' | 'silent' | 'handled';
+  const streamReply = async (o: { endpoint: string; body: string; reqStart: number; showError: (d: string) => void; voice?: boolean }): Promise<StreamOutcome> => {
+    const baseUrl = getBackendBaseUrl();
+    const controller = new AbortController();
+    // the first answer may need a cold start of the free server -> allow it; once flowing, 20 s of silence = stalled
+    let timer = setTimeout(() => controller.abort(), o.voice ? 60000 : 45000);
+    let speech: ReturnType<typeof machiVoice.beginStream> | null = null;
+    const msgId = 'm' + Date.now() + Math.random().toString(36).slice(2, 6);
+    let sawSentence = false, heardAny = false, handledLocally = false;
+    let doneEvt: any = null;
+    let errorText: string | null = null;
+    try {
+      console.log(`[Machi] POST ${baseUrl}${o.endpoint}`);
+      const res = await fetch(`${baseUrl}${o.endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: o.body, signal: controller.signal });
+      if (!res.ok || !res.body) { console.warn(`[Machi] stream HTTP ${res.status}`); return 'fallback'; }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        clearTimeout(timer);
+        timer = setTimeout(() => controller.abort(), 20000);
+        buf += decoder.decode(value, { stream: true });
+        const parsed = parseSse(buf);
+        buf = parsed.rest;
+        for (const ev of parsed.events) {
+          if (ev.type === 'heard') {
+            const h = String(ev.text || '').trim();
+            if (h) {
+              heardAny = true;
+              console.log(`[Machi Timing] heard=${Date.now() - o.reqStart}ms "${h.slice(0, 80)}"`);
+              setMessages(prev => [...prev, { id: 'u' + Date.now(), sender: 'user', text: h, timestamp: nowStampStr() }]);
+              if (pendingCallRef.current && (isYes(h) || isNo(h))) {   // "yes" / "cancel" answers the call confirmation, not the AI
+                handledLocally = true;
+                controller.abort();
+                if (isYes(h)) confirmPendingCall(); else cancelPendingCall();
+                return 'handled';
+              }
+            }
+          } else if (ev.type === 'sentence' && typeof ev.text === 'string' && ev.text.trim()) {
+            if (!sawSentence) {
+              sawSentence = true;
+              console.log(`[Machi Timing] first_sentence=${Date.now() - o.reqStart}ms`);
+              setFirstSentenceShown(true);
+              setMessages(prev => [...prev, { id: msgId, sender: 'machi', text: ev.text, timestamp: nowStampStr() }]);
+              speech = machiVoice.beginStream(selectedVoiceRef.current, undefined, finishHandsFree);
+            } else {
+              setMessages(prev => prev.map(m => m.id === msgId ? { ...m, text: m.text + ' ' + ev.text } : m));
+            }
+            speech!.push(ev.text);
+          } else if (ev.type === 'done') {
+            doneEvt = ev;
+          } else if (ev.type === 'error') {
+            errorText = String(ev.error || 'The AI service did not answer.');
+          }
+        }
+      }
+    } catch (e: any) {
+      if (handledLocally) return 'handled';
+      console.warn('[Machi] stream problem:', String(e));
+      if (!sawSentence) return 'fallback';
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!sawSentence) {
+      if (errorText) { o.showError(o.voice ? errorText : `${errorText} Tap Retry.`); return 'done'; }
+      if (doneEvt?.noSpeech || (o.voice && !heardAny && doneEvt)) return 'silent';
+      return doneEvt ? 'done' : 'fallback';
+    }
+    console.log(`[Machi Timing] stream_total=${Date.now() - o.reqStart}ms server=${doneEvt?.latencyMs}ms model=${doneEvt?.modelUsed}`);
+    setMessages(prev => prev.map(m => m.id === msgId
+      ? { ...m, intent: doneEvt?.intent, sources: doneEvt?.sources, latencyMs: doneEvt?.latencyMs, modelUsed: doneEvt?.modelUsed }
+      : m));
+    applyAction(doneEvt);
+    noteExchangeDone();
+    speech!.end().then(ok => {
+      if (!ok) setVoiceError('Voice playback failed - the reply is shown as text. Use "Replay voice" to retry.');
+    });
+    return 'done';
+  };
+
+  // A recorded voice turn: the phone records you, the server transcribes + answers, Machi speaks right away
+  const handleVoiceAudio = async (b64: string, mime: string) => {
+    if (isLoadingRef.current) return;
+    machiVoice.unlockAudio();
+    isLoadingRef.current = true;
+    setFirstSentenceShown(false);
+    setIsLoading(true);
+    const reqStart = Date.now();
+    const showError = (detail: string) => setMessages(prev => [...prev, { id: 'e' + Date.now(), sender: 'machi', text: detail, timestamp: nowStampStr(), isError: true }]);
+    let outcome: StreamOutcome = 'fallback';
+    try {
+      if (!getBackendBaseUrl() && isEmbeddedApp()) {
+        showError('Backend server is not configured. Set the Machi server URL (Settings) and try again.');
+        return;
+      }
+      const body = JSON.stringify(buildPayload({ audioBase64: b64, mimeType: mime }));
+      outcome = await streamReply({ endpoint: '/api/machi/voice/stream', body, reqStart, showError, voice: true });
+      if (outcome === 'fallback') {                       // a blip or a cold server: try once more
+        outcome = await streamReply({ endpoint: '/api/machi/voice/stream', body, reqStart, showError, voice: true });
+      }
+      if (outcome === 'fallback') showError("I couldn't reach the Machi server just now. Check your internet connection - I'll keep listening.");
+    } finally {
+      isLoadingRef.current = false;
+      setIsLoading(false);
+    }
+    // nothing was said / nothing came back: keep the "call" open and listen again
+    if (outcome === 'silent' || outcome === 'fallback' || outcome === 'handled') finishHandsFree();
+  };
+  handleVoiceRef.current = handleVoiceAudio;
+
+  const handleCaptureError = (code: string) => {
+    console.warn('[Machi capture]', code);
+    setInterimTranscript('');
+    if (code === 'no_permission') {
+      setIsListening(false); setIsHandsFree(false);
+      setVoiceError('Microphone permission is denied. Allow it in Android Settings > Apps > Machi > Permissions.');
+      return;
+    }
+    if (code === 'record_failed') {                       // this phone will not let us record directly: use Android's recognizer instead
+      captureFailedRef.current = true;
+      setVoiceError("Couldn't open the microphone directly - switching to Android speech recognition.");
+      setTimeout(() => startListeningAction(), 300);
+      return;
+    }
+    if (isHandsFreeRef.current && !machiVoice.getSpeakingState()) {   // no_speech: like a phone call, keep waiting
+      setTimeout(() => {
+        if (isHandsFreeRef.current && !machiVoice.getSpeakingState() && !isLoadingRef.current) startListeningAction();
+      }, 300);
+    } else {
+      setIsListening(false);
+    }
+  };
+  captureErrRef.current = handleCaptureError;
 
   const handleSendMessage = async (textToSend?: string, isRetry: boolean = false) => {
     machiVoice.unlockAudio();
@@ -412,6 +775,11 @@ export default function App() {
       const userMsg: Message = { id: Date.now().toString(), sender: 'user', text, timestamp: stamp() };
       setMessages(prev => [...prev, userMsg]);
       if (!textToSend) setInputText('');
+      // a pending "Call X?" is answered by yes / cancel, not sent to the AI
+      if (pendingCallRef.current && (isYes(text) || isNo(text))) {
+        if (isYes(text)) confirmPendingCall(); else cancelPendingCall();
+        return;
+      }
     }
     isLoadingRef.current = true; // synchronous guard: blocks a second request before React re-renders
     setFirstSentenceShown(false);
@@ -436,101 +804,14 @@ export default function App() {
         return;
       }
 
-      const history = messages.filter(m => !m.isError).slice(-8).map(m => ({
-        user: m.sender === 'user' ? m.text : undefined,
-        machi: m.sender === 'machi' ? m.text : undefined,
-      }));
-
       const reqStart = Date.now();
       const alternatives = lastAlternativesRef.current;
       lastAlternativesRef.current = [];
-      const body = JSON.stringify({ message: text, conversationHistory: history, alternatives, languagePreference: speechLanguage });
+      const body = JSON.stringify(buildPayload({ message: text, alternatives }));
 
-      // ---------- Real-time path: stream the reply and start SPEAKING after the first sentence ----------
-      const finishHandsFree = () => {
-        if (isHandsFreeRef.current) {
-          setTimeout(() => {
-            if (isHandsFreeRef.current && !machiVoice.getSpeakingState()) startListeningAction();
-          }, 400);
-        }
-      };
-      const runStream = async (): Promise<'done' | 'fallback'> => {
-        const controller = new AbortController();
-        // first sentence may need a cold start (free server) -> 45s; once flowing, 20s of silence = stalled
-        let timer = setTimeout(() => controller.abort(), 45000);
-        let speech: ReturnType<typeof machiVoice.beginStream> | null = null;
-        const msgId = (Date.now() + 1).toString();
-        let sawSentence = false;
-        let doneEvt: any = null;
-        let errorText: string | null = null;
-        try {
-          console.log(`[Machi] POST ${baseUrl}/api/machi/chat/stream`);
-          const res = await fetch(`${baseUrl}/api/machi/chat/stream`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body,
-            signal: controller.signal
-          });
-          if (!res.ok || !res.body) { console.warn(`[Machi] stream HTTP ${res.status} -> using standard endpoint`); return 'fallback'; }
-          const reader = res.body.getReader();
-          const decoder = new TextDecoder();
-          let buf = '';
-          for (;;) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            clearTimeout(timer);
-            timer = setTimeout(() => controller.abort(), 20000);
-            buf += decoder.decode(value, { stream: true });
-            const parsed = parseSse(buf);
-            buf = parsed.rest;
-            for (const ev of parsed.events) {
-              if (ev.type === 'sentence' && typeof ev.text === 'string' && ev.text.trim()) {
-                if (!sawSentence) {
-                  sawSentence = true;
-                  console.log(`[Machi Timing] first_sentence=${Date.now() - reqStart}ms`);
-                  setFirstSentenceShown(true);
-                  setMessages(prev => [...prev, { id: msgId, sender: 'machi', text: ev.text, timestamp: stamp() }]);
-                  speech = machiVoice.beginStream(selectedVoiceRef.current, undefined, finishHandsFree);
-                } else {
-                  setMessages(prev => prev.map(m => m.id === msgId ? { ...m, text: m.text + ' ' + ev.text } : m));
-                }
-                speech!.push(ev.text);
-              } else if (ev.type === 'done') {
-                doneEvt = ev;
-              } else if (ev.type === 'error') {
-                errorText = String(ev.error || 'The AI service did not answer.');
-              }
-            }
-          }
-        } catch (e: any) {
-          console.warn('[Machi] stream problem:', String(e));
-          if (!sawSentence) return 'fallback';
-        } finally {
-          clearTimeout(timer);
-        }
-
-        if (!sawSentence) {
-          if (errorText) { showError(`${errorText} Tap Retry.`); return 'done'; }
-          return 'fallback';
-        }
-        console.log(`[Machi Timing] stream_total=${Date.now() - reqStart}ms server_latency=${doneEvt?.latencyMs}ms model=${doneEvt?.modelUsed}`);
-        setMessages(prev => prev.map(m => m.id === msgId
-          ? { ...m, intent: doneEvt?.intent, sources: doneEvt?.sources, latencyMs: doneEvt?.latencyMs, modelUsed: doneEvt?.modelUsed }
-          : m));
-        if (doneEvt?.intent === 'create_reminder' && doneEvt.actionData?.reminderTitle) {
-          setReminders(prev => [...prev, {
-            id: Date.now().toString(),
-            title: doneEvt.actionData.reminderTitle,
-            time: doneEvt.actionData.reminderTime || 'Later today'
-          }]);
-        }
-        speech!.end().then(ok => {
-          if (!ok) setVoiceError('Voice playback failed - the reply is shown as text. Use "Replay voice" to retry.');
-        });
-        return 'done';
-      };
-      const streamed = await runStream();
-      if (streamed === 'done') return;
+      // Real-time path: stream the reply and start SPEAKING after the first sentence
+      const streamed = await streamReply({ endpoint: '/api/machi/chat/stream', body, reqStart, showError });
+      if (streamed === 'done' || streamed === 'handled') return;
 
       // Streaming unavailable -> standard request (same real AI, whole reply at once).
       // The free Render server sleeps when idle and can need ~50s to wake up, so allow 45s, and retry once on a
@@ -592,16 +873,8 @@ export default function App() {
       };
       setMessages(prev => [...prev, machiMsg]);
 
-      if (data.intent === 'create_reminder' && data.actionData?.reminderTitle) {
-        setReminders(prev => [
-          ...prev,
-          {
-            id: Date.now().toString(),
-            title: data.actionData.reminderTitle,
-            time: data.actionData.reminderTime || 'Later today'
-          }
-        ]);
-      }
+      applyAction(data);
+      noteExchangeDone();
 
       // Hands-free auto-resume once playback is finished
       const onPlaybackFinished = () => {
@@ -672,6 +945,14 @@ export default function App() {
       </select>
       {!compact && (
         <p className="text-[10px] text-slate-500 leading-snug">If the chosen neural voice is busy, Machi briefly uses a backup voice so you never get silence.</p>
+      )}
+      {!compact && (
+        <div className="flex items-center justify-between pt-1 text-[10px] text-slate-500">
+          <span>Memory: {memoryNotes.trim() ? `${memoryNotes.split('\n').filter(l => l.trim()).length} notes` : 'nothing saved yet'}</span>
+          <button onClick={clearMemoryAndChat} className="text-rose-400 hover:text-rose-300 underline">
+            {confirmForget ? 'Tap again to erase' : 'Forget everything'}
+          </button>
+        </div>
       )}
     </div>
   );
@@ -1283,6 +1564,23 @@ export default function App() {
               <div ref={messagesEndRef} />
             </div>
 
+            {/* Call confirmation */}
+            {pendingCall && (
+              <div className="px-3 py-2 border-t border-emerald-900/40 bg-emerald-950/40 shrink-0 flex flex-wrap items-center gap-2">
+                <PhoneCall className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span className="text-xs text-emerald-100 flex-1 min-w-[9rem]">
+                  {pendingCall.candidates && pendingCall.candidates.length ? 'Which contact?' : `Call ${pendingCall.name}?`}
+                  <span className="text-slate-400"> (or say "yes" / "cancel")</span>
+                </span>
+                {pendingCall.candidates && pendingCall.candidates.length
+                  ? pendingCall.candidates.map(c => (
+                      <button key={c.number} onClick={() => confirmPendingCall(c)} className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold">{c.name}</button>
+                    ))
+                  : <button onClick={() => confirmPendingCall()} className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold">Call</button>}
+                <button onClick={cancelPendingCall} className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold">Cancel</button>
+              </div>
+            )}
+
             {/* Quick Prompt Suggestions */}
             <div className="px-3 py-1.5 flex items-center gap-2 overflow-x-auto no-scrollbar border-t border-cyan-900/20 bg-slate-950/80 shrink-0">
               <span className="text-[10px] text-slate-400 whitespace-nowrap">Try asking:</span>
@@ -1584,7 +1882,7 @@ export default function App() {
                       </div>
                     </div>
                     <button
-                      onClick={() => setReminders(prev => prev.filter(r => r.id !== reminder.id))}
+                      onClick={() => removeReminder(reminder.id)}
                       className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-500 hover:text-rose-400 transition-colors"
                       title="Dismiss reminder"
                     >

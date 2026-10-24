@@ -69,3 +69,28 @@ NOT tested: real Gemini/Edge calls, real phone, real earbuds, real microphone, A
 - Android audio: Bluetooth (SCO / communication device), wired and built-in mic detection with BLUETOOTH_CONNECT
   permission; call-style routing while listening, released when the mic is turned off or the app backgrounds.
 - Speech end detection 1.5s/1.2s (was 2.8s/2.4s) so answers start sooner.
+
+---
+# Round 5: recognition, reminders, calls, memory, real-time loop
+Tests (run: bash tests/run-all.sh; needs Node 22.6+ and a JDK; no network): actions 53, race 7, stream helpers 10, speech
+chunking 6, client speech session 10, server vs SIMULATED Google/Edge 33, microphone speech detector (Java) 13 - all pass.
+Type-check of App.tsx with stubbed React types: clean (a planted bug was caught, so the check is real).
+NOT tested (needs a phone): real Gemini/Edge, real microphone / Bluetooth / wired headset, notifications, contacts, calls.
+- Listening: the phone records the mic itself (16 kHz) with its own end-of-speech detection (follows room noise, so soft
+  voices are caught), amplifies soft speech up to 30x, routes to Bluetooth / wired / built-in mic, and the SERVER
+  transcribes it with Gemini (Tamil / Tanglish / English). Android's recognizer is only a fallback.
+- Reminders: before this round they were only a list on screen - nothing ever fired. Now: AI extracts the time, the
+  phone schedules an exact alarm (AlarmManager.setAlarmClock), shows a high-priority notification, survives closing the
+  app and rebooting. Needs notification permission (Android 13+); the app asks.
+- Calls: AI extracts the name, the app asks "Call X?" (button or say "yes"/"cancel"), looks the name up in contacts
+  (permission asked), then places the call (CALL_PHONE permission asked; falls back to opening the dialer).
+- Memory: chat is saved on the phone (last 200 messages), the last 20 turns go with every request, and short
+  "notes about you" are rewritten every 4 exchanges and sent too. "Forget everything" erases both.
+- Signing key is now reused between builds so updates install over the old app.
+
+---
+# Signing / install conflict ("App not installed as package conflicts with an existing package")
+Cause: every CI build used a NEW random key, so Android refused to update the installed app.
+Fix: all builds sign with the permanent key signing/machi-release.jks (alias machi) or your own via the MACHI_KEYSTORE_B64 +
+MACHI_KS_PASS GitHub secrets. versionCode = 100 + the GitHub run number. ONE-TIME: uninstall the installed Machi, install the new
+APK; later builds update in place. Keep this repository PRIVATE (the key is in it) and never delete signing/machi-release.jks.

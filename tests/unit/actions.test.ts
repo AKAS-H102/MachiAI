@@ -1,0 +1,26 @@
+import { looksLikeReminder, looksLikeCall, isYes, isNo, resolveWhen, formatWhen, parseJsonLoose, localNowString, lastMachiAskedForTime } from "../../lib/actions.ts";
+let pass=0,fail=0; const t=(n:string,c:boolean,x?:any)=>{c?pass++:fail++;console.log((c?"PASS ":"FAIL ")+n+(c||x===undefined?"":" -> "+JSON.stringify(x)))};
+for (const s of ["remind me to take medicine at 5pm","set a reminder for 10 minutes","Amma ku call panna ninaivu paduthu","wake me at 6 am","set alarm for 7","reminder vai da"]) t("reminder: "+s, looksLikeReminder(s));
+for (const s of ["what is a reminder app","tell me a joke","hello machi"]) t("not reminder: "+s, !looksLikeReminder(s));
+for (const s of ["call mom","Call Amma","amma ku call pannu","phone pannu appa ku","dial 9876543210","ring my brother","call Ravi please","Rahul ah call panni sollu"]) t("call: "+s, looksLikeCall(s));
+for (const s of ["what is call of duty","how to call a function in python","call me later","remind me to call mom","explain call stack","hello"]) t("not call: "+s, !looksLikeCall(s));
+for (const s of ["yes","Yes please","ok","aama","seri pannu","go ahead","Call","ஆமா"]) t("yes: "+s, isYes(s));
+for (const s of ["no","cancel","venam","vendam da","illa","don't call","wait"]) t("no: "+s, isNo(s)&&!isYes(s));
+t("long sentence is not a confirmation", !isYes("yes I want to know more about how call of duty works today") );
+t("'no problem' style negative wins over yes", !isYes("no ok cancel"));
+// time resolution: now = 2026-10-24 12:00 IST (UTC+5:30) = 06:30 UTC
+const tz=330, now=Date.UTC(2026,9,24,6,30);
+t("inMinutes 10", resolveWhen({inMinutes:10},now,tz)===now+600000);
+let w=resolveWhen({localDateTime:"2026-10-24 17:30"},now,tz)!; t("local 17:30 IST => 12:00 UTC", w===Date.UTC(2026,9,24,12,0), new Date(w).toISOString());
+t("format today", formatWhen(w,now,tz)==="Today 5:30 PM", formatWhen(w,now,tz));
+w=resolveWhen({localDateTime:"2026-10-25 09:00"},now,tz)!; t("format tomorrow 9 AM", formatWhen(w,now,tz)==="Tomorrow 9:00 AM", formatWhen(w,now,tz));
+w=resolveWhen({localDateTime:"2026-10-30 00:05"},now,tz)!; t("format later date midnight", formatWhen(w,now,tz)==="30 Oct 12:05 AM", formatWhen(w,now,tz));
+t("past time rejected", resolveWhen({localDateTime:"2026-10-24 09:00"},now,tz)===null);
+t("garbage rejected", resolveWhen({localDateTime:"soon"},now,tz)===null && resolveWhen({},now,tz)===null && resolveWhen({inMinutes:-5},now,tz)===null);
+t("> 1 year rejected", resolveWhen({localDateTime:"2028-01-01 10:00"},now,tz)===null);
+t("negative tz works (UTC-5)", resolveWhen({localDateTime:"2026-10-24 12:00"},Date.UTC(2026,9,24,16,0),-300)===Date.UTC(2026,9,24,17,0));
+t("parseJsonLoose fenced", parseJsonLoose('```json\n{"a":1}\n```')?.a===1);
+t("parseJsonLoose with chatter", parseJsonLoose('Sure! {"a":2} done')?.a===2);
+t("localNowString", localNowString(now,tz)==="Saturday 2026-10-24 12:00 (UTC+05:30)", localNowString(now,tz));
+t("lastMachiAskedForTime", lastMachiAskedForTime([{user:"remind me to call mom"},{machi:'Seri da! "call mom" ku enna time-ku remind pannanum?'}]) && !lastMachiAskedForTime([{machi:"hello"}]));
+console.log(`${pass} passed, ${fail} failed`); process.exit(fail?1:0);

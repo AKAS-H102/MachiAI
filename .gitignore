@@ -3,3 +3,6 @@ dist
 .env
 *.keystore
 staging-android/bin
+release
+tests/server-sim/work
+tests/android/out

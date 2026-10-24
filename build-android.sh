@@ -12,20 +12,19 @@ S=staging-android
 node scripts/inline-html.mjs dist dist/index.single.html
 rm -rf $S/assets/www && mkdir -p $S/assets/www && cp dist/index.single.html $S/assets/www/index.html
 printf '%s' "$BACKEND_URL" > $S/assets/backend_url.txt
+[ -n "${VERSION_CODE:-}" ] && sed -i "s/android:versionCode=\"[0-9]*\"/android:versionCode=\"$VERSION_CODE\"/" $S/AndroidManifest.xml
 rm -rf $S/bin && mkdir -p $S/bin/classes
-javac -Xlint:-options -source 8 -target 8 -cp "$ANDROID_JAR" -d $S/bin/classes $S/src/ai/machi/assistant/MainActivity.java
+javac -Xlint:-options -source 8 -target 8 -cp "$ANDROID_JAR" -d $S/bin/classes $(find $S/src -name '*.java')
 d8 --min-api 21 --lib "$ANDROID_JAR" --output $S/bin $(find $S/bin/classes -name '*.class')
 aapt2 compile --dir $S/res -o $S/bin/res.zip
 aapt2 link -o $S/bin/unaligned.apk -I "$ANDROID_JAR" --manifest $S/AndroidManifest.xml -A $S/assets $S/bin/res.zip
 ( cd $S/bin && zip -q -u unaligned.apk classes.dex )
 zipalign -f 4 $S/bin/unaligned.apk $S/bin/aligned.apk
-# Signing key is NOT shipped in the repo. Use your own (KEYSTORE=/path KS_ALIAS=name) or a throwaway debug key.
-if [ -z "${KEYSTORE:-}" ]; then
-  KEYSTORE=$S/bin/debug.keystore; KS_ALIAS=machi-debug
-  [ -f "$KEYSTORE" ] || keytool -genkeypair -keystore "$KEYSTORE" -alias $KS_ALIAS -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Machi Debug"
-  apksigner sign --ks "$KEYSTORE" --ks-key-alias $KS_ALIAS --ks-pass pass:android --out release/Machi.apk $S/bin/aligned.apk
-else
-  apksigner sign --ks "$KEYSTORE" --ks-key-alias "${KS_ALIAS:?set KS_ALIAS}" --out release/Machi.apk $S/bin/aligned.apk
-fi
+# Signing: ALWAYS the same key, otherwise Android says "package conflicts with an existing package" on update.
+# Priority: KEYSTORE env (+KS_ALIAS, KS_PASS) -> committed signing/machi-release.jks. Never a random per-build key.
+KEYSTORE="${KEYSTORE:-signing/machi-release.jks}"; KS_ALIAS="${KS_ALIAS:-machi}"; KS_PASS="${KS_PASS:-machi-pass}"
+[ -f "$KEYSTORE" ] || { echo "Keystore $KEYSTORE not found - refusing to build with a random key"; exit 1; }
+mkdir -p release
+apksigner sign --ks "$KEYSTORE" --ks-key-alias "$KS_ALIAS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" --out release/Machi.apk $S/bin/aligned.apk
 apksigner verify -v release/Machi.apk
 echo "Built release/Machi.apk"

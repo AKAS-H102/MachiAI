@@ -23,6 +23,15 @@ import android.media.AudioManager;
 import android.media.AudioAttributes;
 import android.media.AudioDeviceCallback;
 import android.media.AudioDeviceInfo;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
+import android.media.audiofx.AutomaticGainControl;
+import android.media.audiofx.NoiseSuppressor;
+import android.database.Cursor;
+import android.net.Uri;
+import android.provider.ContactsContract;
+import android.provider.Settings;
 import android.content.BroadcastReceiver;
 import android.content.IntentFilter;
 import android.os.Handler;
@@ -67,6 +76,15 @@ public class MainActivity extends Activity {
     private Runnable mScoPending = null;
     private AudioDeviceCallback mRouteCallback = null;
     private static final String BT_CONNECT = "android.permission.BLUETOOTH_CONNECT";
+    private static final String POST_NOTIF = "android.permission.POST_NOTIFICATIONS";
+    private static final int PERMISSION_CALL_CODE = 102;
+    private String mPendingCallName = null;
+    private String mPendingDialNumber = null, mPendingDialLabel = null;
+    private boolean mCallPermAsked = false;
+    private boolean mPendingCapture = false;
+    private volatile boolean mCaptureRunning = false;
+    private volatile int mCaptureGen = 0;
+    private volatile byte[] mCapturedWav = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -142,6 +160,9 @@ public class MainActivity extends Activity {
             }
             if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(BT_CONNECT) != PackageManager.PERMISSION_GRANTED) {
                 need.add(BT_CONNECT);
+            }
+            if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(POST_NOTIF) != PackageManager.PERMISSION_GRANTED) {
+                need.add(POST_NOTIF); // without it Android hides reminder notifications
             }
             if (!need.isEmpty()) {
                 requestPermissions(need.toArray(new String[0]), PERMISSION_REQUEST_CODE);
@@ -319,6 +340,7 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == PERMISSION_CALL_CODE) { handleCallPermissionResult(permissions, grantResults); return; }
         if (requestCode == PERMISSION_REQUEST_CODE) {
             boolean micAsked = false, granted = false;
             for (int i = 0; i < permissions.length && i < grantResults.length; i++) {
@@ -332,6 +354,17 @@ public class MainActivity extends Activity {
             }
             if (!micAsked) return;
             Log.d(TAG, "RECORD_AUDIO permission granted=" + granted);
+            if (mPendingCapture) {
+                mPendingCapture = false;
+                if (granted) {
+                    mWebView.post(new Runnable() { @Override public void run() {
+                        routeAudioThen(new Runnable() { @Override public void run() { startCaptureInternal(); } });
+                    } });
+                } else {
+                    evalJs("window.onMachiCaptureError && window.onMachiCaptureError('no_permission');");
+                }
+                return;
+            }
             if (granted && mPendingStartListening) {
                 mPendingStartListening = false;
                 mWebView.post(new Runnable() { @Override public void run() {
@@ -341,6 +374,23 @@ public class MainActivity extends Activity {
                 mPendingStartListening = false;
                 evalJs("window.onMachiNativeSpeechError && window.onMachiNativeSpeechError('no_permission');");
             }
+        }
+    }
+
+    private void handleCallPermissionResult(String[] permissions, int[] grantResults) {
+        boolean contactsOk = false, phoneOk = false;
+        for (int i = 0; i < permissions.length && i < grantResults.length; i++) {
+            boolean ok = grantResults[i] == PackageManager.PERMISSION_GRANTED;
+            if (android.Manifest.permission.READ_CONTACTS.equals(permissions[i])) contactsOk = ok;
+            if (android.Manifest.permission.CALL_PHONE.equals(permissions[i])) phoneOk = ok;
+        }
+        if (mPendingCallName != null) {
+            String n = mPendingCallName; mPendingCallName = null;
+            if (contactsOk) lookupAndCall(n); else callResult("no_permission", "contacts");
+        } else if (mPendingDialNumber != null) {
+            String num = mPendingDialNumber, label = mPendingDialLabel;
+            mPendingDialNumber = null; mPendingDialLabel = null;
+            if (phoneOk) placeCall(num, label); else openDialer(num, label);
         }
     }
 
@@ -644,6 +694,63 @@ public class MainActivity extends Activity {
                 @Override public void run() { stopRecognizerQuietly(); }
             });
         }
+
+        // ---- Own microphone capture (accurate for soft voices and Bluetooth/wired mics): the audio goes to the server for transcription ----
+        @JavascriptInterface
+        public boolean hasCapture() { return true; }
+
+        @JavascriptInterface
+        public void startCapture(final String language) {
+            runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    releasePlayer();
+                    if (!hasMicPermission()) {
+                        mPendingCapture = true;
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, PERMISSION_REQUEST_CODE);
+                        }
+                        return;
+                    }
+                    routeAudioThen(new Runnable() { @Override public void run() { startCaptureInternal(); } });
+                }
+            });
+        }
+
+        // The finished recording (16 kHz mono WAV, base64). Fetched on demand so we never push a huge string through evaluateJavascript.
+        @JavascriptInterface
+        public String takeCapturedAudio() {
+            byte[] w = mCapturedWav;
+            mCapturedWav = null;
+            return w == null ? "" : Base64.encodeToString(w, Base64.NO_WRAP);
+        }
+
+        // ---- Reminders: real alarms + notifications, even when the app is closed ----
+        @JavascriptInterface
+        public String scheduleReminder(String id, String title, String whenMs) {
+            try { return ReminderUtil.schedule(getApplicationContext(), id, title, Long.parseLong(whenMs)); }
+            catch (Exception e) { Log.e(TAG, "scheduleReminder: " + e); return "error"; }
+        }
+
+        @JavascriptInterface
+        public void cancelReminder(String id) { ReminderUtil.cancel(getApplicationContext(), id); }
+
+        @JavascriptInterface
+        public void openNotificationSettings() {
+            runOnUiThread(new Runnable() { @Override public void run() {
+                try {
+                    Intent i = new Intent(Build.VERSION.SDK_INT >= 26 ? Settings.ACTION_APP_NOTIFICATION_SETTINGS : Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                    if (Build.VERSION.SDK_INT >= 26) i.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+                    else i.setData(Uri.fromParts("package", getPackageName(), null));
+                    startActivity(i);
+                } catch (Exception e) { Log.w(TAG, "openNotificationSettings: " + e.getMessage()); }
+            } });
+        }
+
+        // ---- Calling: look the name up in contacts (asks permission), then place the call. JS has already asked the user to confirm. ----
+        @JavascriptInterface
+        public void callContact(final String name, final String number) {
+            runOnUiThread(new Runnable() { @Override public void run() { handleCall(name, number); } });
+        }
     }
 
     // ===================== Audio routing (built-in mic / wired headset / Bluetooth earbuds) =====================
@@ -793,6 +900,170 @@ public class MainActivity extends Activity {
         } catch (Exception e) { Log.w(TAG, "pushVoicesToJs failed: " + e.getMessage()); }
     }
 
+    // ===================== Microphone capture (voice-activity detection lives in SpeechCapture, which is unit-tested) =====================
+    private void startCaptureInternal() {
+        mCaptureRunning = true;
+        final int gen = ++mCaptureGen;
+        final boolean sco = mScoActive;
+        new Thread(new Runnable() { @Override public void run() { runCapture(gen, sco); } }, "machi-capture").start();
+    }
+
+    private void captureError(String code) {
+        evalJs("window.onMachiCaptureError && window.onMachiCaptureError(" + jsStr(code) + ");");
+    }
+
+    private void runCapture(int gen, boolean sco) {
+        final int SR = SpeechCapture.SAMPLE_RATE;
+        AudioRecord rec = null;
+        AutomaticGainControl agc = null;
+        NoiseSuppressor ns = null;
+        try {
+            int minBuf = AudioRecord.getMinBufferSize(SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+            if (minBuf <= 0) { captureError("record_failed"); return; }
+            int bufBytes = Math.max(minBuf, SR);           // ~0.5 s
+            int[] sources = sco ? new int[]{MediaRecorder.AudioSource.VOICE_COMMUNICATION, MediaRecorder.AudioSource.MIC}
+                                : new int[]{MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC};
+            for (int src : sources) {
+                try {
+                    AudioRecord r = new AudioRecord(src, SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufBytes);
+                    if (r.getState() == AudioRecord.STATE_INITIALIZED) { rec = r; Log.d(TAG, "capture source=" + src + " sco=" + sco); break; }
+                    r.release();
+                } catch (Exception e) { Log.w(TAG, "AudioRecord source " + src + " failed: " + e.getMessage()); }
+            }
+            if (rec == null) { captureError("record_failed"); return; }
+            if (Build.VERSION.SDK_INT >= 23) {
+                try {
+                    AudioDeviceInfo dev = findInput(true);       // Bluetooth earbuds first,
+                    if (dev == null) dev = findInput(false);     // then wired / USB headset, else the phone mic
+                    if (dev != null) { rec.setPreferredDevice(dev); Log.d(TAG, "capture device=" + devName(dev) + " type=" + dev.getType()); }
+                } catch (Exception e) { Log.w(TAG, "setPreferredDevice: " + e.getMessage()); }
+            }
+            try {
+                if (AutomaticGainControl.isAvailable()) { agc = AutomaticGainControl.create(rec.getAudioSessionId()); if (agc != null) agc.setEnabled(true); }
+                if (NoiseSuppressor.isAvailable()) { ns = NoiseSuppressor.create(rec.getAudioSessionId()); if (ns != null) ns.setEnabled(true); }
+            } catch (Exception e) { Log.w(TAG, "audio effects: " + e.getMessage()); }
+
+            rec.startRecording();
+            if (rec.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) { captureError("record_failed"); return; }
+            evalJs("window.onMachiCaptureStart && window.onMachiCaptureStart();");
+
+            SpeechCapture cap = new SpeechCapture(900, 12000);   // 0.9 s of quiet ends your turn; 12 s of nothing = give up
+            short[] frame = new short[SpeechCapture.FRAME];
+            SpeechCapture.Event ev = SpeechCapture.Event.NONE;
+            String reason = "cancelled";
+            while (mCaptureRunning && gen == mCaptureGen) {
+                int n = rec.read(frame, 0, SpeechCapture.FRAME);
+                if (n <= 0) {
+                    if (n == AudioRecord.ERROR_DEAD_OBJECT || n == AudioRecord.ERROR_INVALID_OPERATION) { reason = "error"; break; }
+                    continue;
+                }
+                ev = cap.feed(frame, n, System.currentTimeMillis());
+                if (ev == SpeechCapture.Event.SPEECH_START) evalJs("window.onMachiCaptureSpeech && window.onMachiCaptureSpeech();");
+                else if (ev == SpeechCapture.Event.END) { reason = "ended"; break; }
+                else if (ev == SpeechCapture.Event.TIMEOUT) { reason = "timeout"; break; }
+            }
+            if (!"ended".equals(reason)) {
+                if ("timeout".equals(reason)) captureError("no_speech");
+                else if ("error".equals(reason)) captureError("record_failed");
+                return;                                          // cancelled: say nothing
+            }
+            mCapturedWav = cap.finishWav();
+            Log.d(TAG, "capture done " + cap.lastDurationMs + "ms peak=" + cap.lastPeak + " gain=" + cap.lastGain + " noise=" + (int) cap.noiseLevel());
+            evalJs("window.onMachiAudioReady && window.onMachiAudioReady(" + cap.lastDurationMs + ");");
+        } catch (Exception e) {
+            Log.e(TAG, "capture failed: " + e);
+            captureError("record_failed");
+        } finally {
+            try { if (agc != null) agc.release(); } catch (Exception ignored) {}
+            try { if (ns != null) ns.release(); } catch (Exception ignored) {}
+            if (rec != null) {
+                try { rec.stop(); } catch (Exception ignored) {}
+                try { rec.release(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    // ===================== Calling =====================
+    private void callResult(String status, String detail) {
+        evalJs("window.onMachiNativeCall && window.onMachiNativeCall(" + jsStr(status) + "," + jsStr(detail == null ? "" : detail) + ");");
+    }
+
+    private void handleCall(String name, String number) {
+        String digits = number == null ? "" : number.replaceAll("[^0-9+]", "");
+        String label = (name != null && name.trim().length() > 0) ? name.trim() : digits;
+        if (digits.length() >= 5) { placeCall(digits, label); return; }
+        if (name == null || name.trim().isEmpty()) { callResult("not_found", ""); return; }
+        if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission(android.Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            mPendingCallName = name.trim();
+            mCallPermAsked = true;
+            requestPermissions(new String[]{android.Manifest.permission.READ_CONTACTS, android.Manifest.permission.CALL_PHONE}, PERMISSION_CALL_CODE);
+            return;
+        }
+        lookupAndCall(name.trim());
+    }
+
+    private ArrayList<String[]> findContacts(String name) {
+        ArrayList<String[]> out = new ArrayList<String[]>();
+        java.util.HashSet<String> seen = new java.util.HashSet<String>();
+        ArrayList<String> needles = new ArrayList<String>();
+        needles.add(name);
+        for (String w : name.split("\\s+")) if (w.length() >= 3 && !w.equalsIgnoreCase(name)) needles.add(w);
+        for (String needle : needles) {
+            Cursor cur = null;
+            try {
+                cur = getContentResolver().query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                    new String[]{ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER},
+                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?", new String[]{"%" + needle + "%"},
+                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC");
+                while (cur != null && cur.moveToNext() && out.size() < 6) {
+                    String n = cur.getString(0), num = cur.getString(1);
+                    if (num == null) continue;
+                    String key = num.replaceAll("[^0-9]", "");
+                    if (key.length() > 10) key = key.substring(key.length() - 10);
+                    if (seen.add(key)) out.add(new String[]{n, num});
+                }
+            } catch (Exception e) { Log.w(TAG, "contacts query failed: " + e.getMessage());
+            } finally { if (cur != null) cur.close(); }
+            if (!out.isEmpty()) break;                             // the full name matched: do not widen the search
+        }
+        return out;
+    }
+
+    private void lookupAndCall(String name) {
+        ArrayList<String[]> found = findContacts(name);
+        if (found.isEmpty()) { callResult("not_found", name); return; }
+        if (found.size() > 1) {                                    // an exact-name match wins
+            for (String[] f : found) if (f[0] != null && f[0].equalsIgnoreCase(name)) { found.clear(); found.add(f); break; }
+        }
+        if (found.size() == 1) { placeCall(found.get(0)[1], found.get(0)[0]); return; }
+        try {
+            JSONArray arr = new JSONArray();
+            for (String[] f : found) { JSONObject o = new JSONObject(); o.put("name", f[0]); o.put("number", f[1]); arr.put(o); }
+            callResult("multiple", arr.toString());
+        } catch (Exception e) { callResult("error", "contacts"); }
+    }
+
+    private void placeCall(String number, String label) {
+        if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission(android.Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            if (mCallPermAsked) { openDialer(number, label); return; }   // already asked and declined: open the dialer instead
+            mCallPermAsked = true;
+            mPendingDialNumber = number; mPendingDialLabel = label;
+            requestPermissions(new String[]{android.Manifest.permission.CALL_PHONE}, PERMISSION_CALL_CODE);
+            return;
+        }
+        try {
+            startActivity(new Intent(Intent.ACTION_CALL, Uri.fromParts("tel", number, null)));
+            callResult("calling", label);
+        } catch (Exception e) { Log.w(TAG, "ACTION_CALL failed: " + e.getMessage()); openDialer(number, label); }
+    }
+
+    private void openDialer(String number, String label) {
+        try {
+            startActivity(new Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", number, null)));
+            callResult("dialer", label);
+        } catch (Exception e) { callResult("error", "dialer"); }
+    }
+
     private void releasePlayer() {
         if (mMediaPlayer != null) {
             try { if (mMediaPlayer.isPlaying()) mMediaPlayer.stop(); } catch (Exception ignored) {}
@@ -803,6 +1074,7 @@ public class MainActivity extends Activity {
 
     private void stopRecognizerQuietly() {
         mIsListening = false;
+        mCaptureRunning = false;
         if (mSpeechRecognizer != null) {
             try { mSpeechRecognizer.stopListening(); } catch (Exception ignored) {}
         }
@@ -830,6 +1102,7 @@ public class MainActivity extends Activity {
         if (mSpeechRecognizer != null) {
             try { mSpeechRecognizer.stopListening(); } catch (Exception ignored) {}
         }
+        mCaptureRunning = false;
         stopBluetoothCall();
     }
 

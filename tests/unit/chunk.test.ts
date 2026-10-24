@@ -1,0 +1,11 @@
+import { chunkSentences } from "../../src/utils/machiVoice.ts";
+let f=0; const t=(n:string,c:boolean)=>{console.log((c?"PASS ":"FAIL ")+n); if(!c)f++;};
+t("short reply -> 1 request", JSON.stringify(chunkSentences(["Hey machi.","Epdi irukka?","Enna venum?"]))===JSON.stringify(["Hey machi. Epdi irukka? Enna venum?"]));
+const long1="A".repeat(100)+".", s2="B".repeat(100)+".", s3="C".repeat(100)+".", s4="D".repeat(100)+".";
+const c=chunkSentences([long1,s2,s3,s4]);
+t("first chunk stays <=140 for fast start", c[0]===long1 && c.length===2 && c[1]===s2+" "+s3+" "+s4 === false || c[0].length<=140);
+t("later chunks <=260", c.slice(1).every(x=>x.length<=260));
+t("no text lost", c.join(" ")===[long1,s2,s3,s4].join(" "));
+t("one very long sentence kept whole", chunkSentences(["X".repeat(500)]).length===1);
+t("empties ignored", chunkSentences(["", "  ", "Hi."]).join()==="Hi.");
+console.log(JSON.stringify(c.map(x=>x.length))); process.exit(f?1:0);

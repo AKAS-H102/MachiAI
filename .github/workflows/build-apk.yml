@@ -12,9 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with: { node-version: 22 }
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
+      - name: Run tests (no network or API key needed)
+        continue-on-error: true      # a failing test is shown in the log but never blocks you from getting an APK
+        run: bash tests/run-all.sh
       - name: Locate Android SDK tools
         run: |
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
@@ -29,10 +32,16 @@ jobs:
         run: |
           sed -i 's/\r$//' build-android.sh
           mkdir -p release
+          export VERSION_CODE=$((100 + ${{ github.run_number }}))
+          # Optional: set repo secrets MACHI_KEYSTORE_B64 / MACHI_KS_PASS to use your own private key instead of signing/machi-release.jks
+          if [ -n "${{ secrets.MACHI_KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.MACHI_KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/machi.jks"
+            export KEYSTORE="$RUNNER_TEMP/machi.jks" KS_PASS="${{ secrets.MACHI_KS_PASS }}"
+          fi
           bash build-android.sh
       - name: Verify APK
         run: |
-          apksigner verify --verbose release/Machi.apk
+          apksigner verify --verbose --print-certs release/Machi.apk | head -12
           aapt2 dump badging release/Machi.apk | grep -E "^package|uses-permission|sdkVersion"
           unzip -l release/Machi.apk | grep -E "classes.dex|assets/www/index.html|backend_url.txt"
           unzip -p release/Machi.apk assets/backend_url.txt; echo
